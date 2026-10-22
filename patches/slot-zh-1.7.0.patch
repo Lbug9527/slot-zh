@@ -1,0 +1,3739 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -942,8 +942,6 @@
+ [[package]]
+ name = "libloading"
+ version = "0.8.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+ dependencies = [
+  "cfg-if",
+  "windows-link",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,3 +29,9 @@
+ inherits = "release"
+ lto = "fat"
+ codegen-units = 1
++
++# Local dev only: libloading 0.8.9 binds kernel32 with raw-dylib, which asks
++# rustc for dlltool/as/ar - tools the portable rust-mingw toolchain here does
++# not ship. The vendored copy links kernel32 through the normal import library.
++[patch.crates-io]
++libloading = { path = "../vendor/libloading" }
+--- a/crates\slot-power\src\sim.rs
++++ b/crates\slot-power\src\sim.rs
+@@ -50,8 +50,15 @@
+     fn set_backlight(&mut self, _step: u8) {}
+ 
+     fn battery(&self) -> Option<Battery> {
++        // SLOT_BATT lets the dev window pretend the console is running flat, so
++        // the low-battery warning can be seen without draining the real pack.
++        let percent = std::env::var("SLOT_BATT")
++            .ok()
++            .and_then(|v| v.parse::<u8>().ok())
++            .unwrap_or(100)
++            .min(100);
+         Some(Battery {
+-            percent: 100,
++            percent,
+             charge: Charge::Charging,
+         })
+     }
+--- a/crates\slot-retro\src\core.rs
++++ b/crates\slot-retro\src\core.rs
+@@ -99,6 +99,14 @@
+     fn start_link(&mut self, _client_id: u16) {}
+     fn pump_link(&mut self) {}
+     fn stop_link(&mut self) {}
++    /// Drop every cheat the core currently has applied.
++    fn cheat_reset(&mut self) {}
++    /// Apply (or clear) one cheat. `code` is the raw GameShark/Action Replay
++    /// text from the card's `.cht` file.
++    fn cheat_set(&mut self, _index: u32, _enabled: bool, _code: &str) {}
++    /// Cheats to apply once the next ROM has loaded. Cores ignore this if they
++    /// have no cheat API.
++    fn queue_cheats(&mut self, _cheats: Vec<(u32, bool, String)>) {}
+ }
+ 
+ #[cfg(test)]
+--- a/crates\slot-retro\src\ffi.rs
++++ b/crates\slot-retro\src\ffi.rs
+@@ -145,6 +145,10 @@
+     pub unserialize: unsafe extern "C" fn(*const c_void, usize) -> bool,
+     pub get_memory_data: unsafe extern "C" fn(c_uint) -> *mut c_void,
+     pub get_memory_size: unsafe extern "C" fn(c_uint) -> usize,
++    /// Optional cheat hooks. Cores that do not expose them simply ignore the
++    /// cheat menu's writes.
++    pub cheat_reset: Option<unsafe extern "C" fn()>,
++    pub cheat_set: Option<unsafe extern "C" fn(c_uint, bool, *const c_char)>,
+ }
+ 
+ impl Api {
+@@ -175,6 +179,14 @@
+             unserialize: get!("retro_unserialize"),
+             get_memory_data: get!("retro_get_memory_data"),
+             get_memory_size: get!("retro_get_memory_size"),
++            cheat_reset: lib
++                .get::<unsafe extern "C" fn()>(b"retro_cheat_reset\0")
++                .ok()
++                .map(|f| *f),
++            cheat_set: lib
++                .get::<unsafe extern "C" fn(c_uint, bool, *const c_char)>(b"retro_cheat_set\0")
++                .ok()
++                .map(|f| *f),
+         })
+     }
+ }
+--- a/crates\slot-retro\src\libretro.rs
++++ b/crates\slot-retro\src\libretro.rs
+@@ -390,6 +390,9 @@
+     rom_path: Option<CString>,
+     av: AvInfo,
+     loaded: bool,
++    /// Cheats to install after the next `load`, because the cores crash if
++    /// `retro_cheat_set` is called before a ROM is in place.
++    queued_cheats: Vec<(u32, bool, String)>,
+     _lib: Library,
+ }
+ 
+@@ -505,6 +508,7 @@
+                 sample_rate: 0.0,
+             },
+             loaded: false,
++            queued_cheats: Vec::new(),
+             _lib: lib,
+         })
+     }
+@@ -553,6 +557,22 @@
+         LibretroCore::set_option(self, key, value);
+     }
+ 
++    fn cheat_reset(&mut self) {
++        if let Some(reset) = self.api.cheat_reset {
++            unsafe { reset() };
++        }
++    }
++
++    fn cheat_set(&mut self, index: u32, enabled: bool, code: &str) {
++        let Some(set) = self.api.cheat_set else { return };
++        let Ok(code) = CString::new(code) else { return };
++        unsafe { set(index, enabled, code.as_ptr()) };
++    }
++
++    fn queue_cheats(&mut self, cheats: Vec<(u32, bool, String)>) {
++        self.queued_cheats = cheats;
++    }
++
+     fn load(&mut self, rom: &Path) -> Result<(), CoreError> {
+         self.unload();
+         self.rom = std::fs::read(rom)?;
+@@ -583,6 +603,15 @@
+             sample_rate: av.timing.sample_rate,
+         };
+         unsafe { (self.api.set_controller_port_device)(0, DEVICE_JOYPAD) };
++        let cheats = std::mem::take(&mut self.queued_cheats);
++        if !cheats.is_empty() {
++            let total = cheats.len();
++            self.cheat_reset();
++            for (index, enabled, code) in cheats {
++                self.cheat_set(index, enabled, &code);
++            }
++            eprintln!("slot: cheats: applied {total} to the core");
++        }
+         Ok(())
+     }
+ 
+--- a/crates\slot-store\src\slot_state.rs
++++ b/crates\slot-store\src\slot_state.rs
+@@ -224,6 +224,12 @@
+     pub wallpaper_tint: WallpaperTint,
+     pub show_recents: bool,
+     pub show_titles: bool,
++    /// Minutes of inactivity before the console powers itself off (0 = never).
++    pub auto_off_min: u16,
++    /// Blink a battery warning in the corner while playing.
++    pub low_batt_alert: bool,
++    /// Battery percentage that counts as low (5..30).
++    pub low_batt_at: u8,
+     pub bezel_gba: BezelPick,
+     pub bezel_gb: BezelPick,
+     pub bezel_gbc: BezelPick,
+@@ -346,6 +352,9 @@
+             wallpaper_tint: WallpaperTint::Off,
+             show_recents: false,
+             show_titles: false,
++            auto_off_min: 0,
++            low_batt_alert: true,
++            low_batt_at: 20,
+             bezel_gba: BezelPick::Ags102,
+             bezel_gb: BezelPick::Ags102,
+             bezel_gbc: BezelPick::Ags102,
+@@ -440,6 +449,9 @@
+     text.push_str(&format!("wallpaper_tint={}\n", s.wallpaper_tint.key()));
+     text.push_str(&format!("show_recents={}\n", s.show_recents as u8));
+     text.push_str(&format!("show_titles={}\n", s.show_titles as u8));
++    text.push_str(&format!("auto_off_min={}\n", s.auto_off_min));
++    text.push_str(&format!("low_batt_alert={}\n", s.low_batt_alert as u8));
++    text.push_str(&format!("low_batt_at={}\n", s.low_batt_at));
+     text.push_str(&format!("bezel_gba={}\n", s.bezel_gba.key()));
+     text.push_str(&format!("bezel_gb={}\n", s.bezel_gb.key()));
+     text.push_str(&format!("bezel_gbc={}\n", s.bezel_gbc.key()));
+@@ -489,6 +501,9 @@
+     let mut wallpaper_tint = None;
+     let mut show_recents = None;
+     let mut show_titles = None;
++    let mut auto_off_min = None;
++    let mut low_batt_alert = None;
++    let mut low_batt_at = None;
+     let mut bezel_gba = None;
+     let mut bezel_gb = None;
+     let mut bezel_gbc = None;
+@@ -528,6 +543,9 @@
+             "wallpaper_tint" => wallpaper_tint = WallpaperTint::parse(value),
+             "show_recents" => show_recents = flag(value),
+             "show_titles" => show_titles = flag(value),
++            "auto_off_min" => auto_off_min = value.parse::<u16>().ok(),
++            "low_batt_alert" => low_batt_alert = flag(value),
++            "low_batt_at" => low_batt_at = value.parse::<u8>().ok(),
+             "bezel_gba" => bezel_gba = Some(BezelPick::parse(value)),
+             "bezel_gb" => bezel_gb = Some(BezelPick::parse(value)),
+             "bezel_gbc" => bezel_gbc = Some(BezelPick::parse(value)),
+@@ -578,6 +596,11 @@
+         wallpaper_tint: wallpaper_tint.unwrap_or(fallback.wallpaper_tint),
+         show_recents: show_recents.unwrap_or(fallback.show_recents),
+         show_titles: show_titles.unwrap_or(fallback.show_titles),
++        auto_off_min: auto_off_min.unwrap_or(fallback.auto_off_min),
++        low_batt_alert: low_batt_alert.unwrap_or(fallback.low_batt_alert),
++        low_batt_at: low_batt_at
++            .map(|v| v.clamp(5, 30))
++            .unwrap_or(fallback.low_batt_at),
+         bezel_gba: bezel_gba.unwrap_or(fallback.bezel_gba),
+         bezel_gb: bezel_gb.unwrap_or(fallback.bezel_gb),
+         bezel_gbc: bezel_gbc.unwrap_or(fallback.bezel_gbc),
+--- a/crates\slot-ui\src\clock.rs
++++ b/crates\slot-ui\src\clock.rs
+@@ -38,17 +38,9 @@
+     format!("{:02}:{:02}", rem / 3600, rem / 60 % 60)
+ }
+ 
+-const MONTHS: [&str; 12] = [
+-    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+-];
+-
+ pub fn date_time_text(secs: i64) -> String {
+     let (_, month, day) = civil_from_days(secs.div_euclid(DAY));
+-    let name = MONTHS
+-        .get((month - 1) as usize)
+-        .copied()
+-        .unwrap_or_default();
+-    format!("{name} {day} {}", hhmm(secs))
++    format!("{month}月{day}日 {}", hhmm(secs))
+ }
+ 
+ #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+--- a/crates\slot-ui\src\icon.rs
++++ b/crates\slot-ui\src\icon.rs
+@@ -282,3 +282,55 @@
+     FONT.get_or_init(|| Font::from_bytes(SYMBOLS_TTF, FontSettings::default()).ok())
+         .as_ref()
+ }
++
++/// Wi-Fi signal glyph: a dot with three arcs, rendered into RGBA.
++/// Returns `(rgba, width, height)`.
++pub fn wifi_face(colour: [u8; 3]) -> (Vec<u8>, u32, u32) {
++    const W: u32 = 28;
++    const H: u32 = 20;
++    const SS: u32 = 4;
++    let cx = W as f32 / 2.0;
++    let cy = H as f32 - 2.5;
++    let mut rgba = vec![0u8; (W * H * 4) as usize];
++    for y in 0..H {
++        for x in 0..W {
++            let mut hits = 0u32;
++            for sy in 0..SS {
++                for sx in 0..SS {
++                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
++                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
++                    let dx = px - cx;
++                    let dy = py - cy;
++                    if dy > 0.0 {
++                        continue;
++                    }
++                    let r = (dx * dx + dy * dy).sqrt();
++                    if r <= 2.5 {
++                        hits += 1;
++                        continue;
++                    }
++                    let mut lit = false;
++                    for radius in [5.6f32, 9.8, 14.0] {
++                        if (r - radius).abs() <= 1.5 && dx.abs() <= r * 0.82 {
++                            lit = true;
++                            break;
++                        }
++                    }
++                    if lit {
++                        hits += 1;
++                    }
++                }
++            }
++            if hits == 0 {
++                continue;
++            }
++            let cover = hits as f32 / (SS * SS) as f32;
++            let i = ((y * W + x) * 4) as usize;
++            rgba[i] = colour[0];
++            rgba[i + 1] = colour[1];
++            rgba[i + 2] = colour[2];
++            rgba[i + 3] = (cover * 255.0) as u8;
++        }
++    }
++    (rgba, W, H)
++}
+--- a/crates\slot-ui\src\lib.rs
++++ b/crates\slot-ui\src\lib.rs
+@@ -12,7 +12,7 @@
+ mod cart;
+ mod clock;
+ mod draw;
+-mod footer;
++pub mod footer;
+ mod hud;
+ mod icon;
+ mod link_art;
+@@ -57,7 +57,7 @@
+     badge_at, ff_badge, footer_ink, FfState, Hud, HudKind, LinkBadge, Millis, ALARM_BAND_H,
+     HUD_ICON_PX, HUD_INK, HUD_MS, LINK_HOST_INK, LINK_JOIN_INK, PLATE_H,
+ };
+-pub use icon::{badge_face, icon_box, icon_face, star_face, warm_fonts, Badge, Icon};
++pub use icon::{badge_face, icon_box, icon_face, star_face, warm_fonts, wifi_face, Badge, Icon};
+ pub use link_art::{
+     link_art, LinkArt, ADAPTER_BASE_X, ADAPTER_BASE_Y, ADAPTER_H, ADAPTER_W, ARCS, ARROW_H,
+     ARROW_LEFT_X, ARROW_RIGHT_X, ARROW_W, ARROW_Y, CLICKS_H, CLICKS_W, CLICKS_X, CLICKS_Y, PLUG_H,
+--- a/crates\slot-ui\src\plate.rs
++++ b/crates\slot-ui\src\plate.rs
+@@ -1,8 +1,8 @@
+ use crate::draw::{Canvas, Draw, TexId};
+ use crate::text;
+ 
+-pub const HINT_H: u32 = 24;
+-pub const CAP: u32 = 20;
++pub const HINT_H: u32 = 32;
++pub const CAP: u32 = 26;
+ const CAP_PAD: u32 = 4;
+ const CAP_MAX_W: f32 = 64.0;
+ pub const HINT_GAP: f32 = 14.0;
+@@ -18,9 +18,9 @@
+ 
+ const INK: [u8; 3] = [0xf6, 0xf4, 0xef];
+ const CAP_INK: [u8; 3] = [0x1a, 0x19, 0x17];
+-const KEY_PX: f32 = 14.0;
+-const LABEL_PX: f32 = 16.0;
+-const LABEL_MIN_PX: f32 = 10.0;
++const KEY_PX: f32 = 18.0;
++const LABEL_PX: f32 = 22.0;
++const LABEL_MIN_PX: f32 = 14.0;
+ const TITLE_PX: f32 = 20.0;
+ const TITLE_MIN_PX: f32 = 12.0;
+ 
+--- a/crates\slot-ui\src\polaroids.rs
++++ b/crates\slot-ui\src\polaroids.rs
+@@ -237,13 +237,13 @@
+         };
+         let delta = parsed - then;
+         if delta < 60 {
+-            return "just now".into();
++            return "刚刚".into();
+         }
+         if delta < 3600 {
+-            return format!("{} min ago", delta / 60);
++            return format!("{} 分钟前", delta / 60);
+         }
+         if delta < RELATIVE_WINDOW {
+-            return format!("{} hr ago", delta / 3600);
++            return format!("{} 小时前", delta / 3600);
+         }
+         format!("{} {}:{}", &stamp[..10], &stamp[11..13], &stamp[14..16])
+     }
+--- a/crates\slot-ui\src\quick_menu.rs
++++ b/crates\slot-ui\src\quick_menu.rs
+@@ -1,4 +1,4 @@
+-use crate::draw::{Canvas, Draw, TexId, OUT_H, OUT_W};
++﻿use crate::draw::{Canvas, Draw, TexId, OUT_H, OUT_W};
+ use crate::plate::{arrows_hint_face, centred_hints, hint_face, UndoFace, HINT_H, LEGEND_GAP};
+ use crate::power_menu::{MENU_H, MENU_INK, MENU_PAD, MENU_PX};
+ use crate::slot_chrome::opening;
+@@ -23,6 +23,7 @@
+     GbPalettes,
+     RunAhead,
+     Theme,
++    Font,
+     Wallpaper,
+     General,
+     Recents,
+@@ -46,10 +47,18 @@
+     GbaBezel,
+     ScreenGbc,
+     ScreenGb,
++    Cheats,
++    Shortcuts,
++    AutoOff,
++    LowBattery,
++    LowBatteryAt,
++    Network,
++    OnlineArt,
++    OnlineCheats,
+ }
+ 
+ impl QuickRow {
+-    pub const ALL: [QuickRow; 40] = [
++    pub const ALL: [QuickRow; 49] = [
+         QuickRow::FastForward,
+         QuickRow::FastForwardSound,
+         QuickRow::Screen,
+@@ -67,6 +76,7 @@
+         QuickRow::GbPalettes,
+         QuickRow::RunAhead,
+         QuickRow::Theme,
++        QuickRow::Font,
+         QuickRow::Wallpaper,
+         QuickRow::General,
+         QuickRow::Recents,
+@@ -90,22 +100,37 @@
+         QuickRow::GbaBezel,
+         QuickRow::ScreenGbc,
+         QuickRow::ScreenGb,
+-    ];
+-
+-    pub const MAIN: [QuickRow; 4] = [
++        QuickRow::Cheats,
++        QuickRow::Shortcuts,
++        QuickRow::AutoOff,
++        QuickRow::LowBattery,
++        QuickRow::LowBatteryAt,
++        QuickRow::Network,
++        QuickRow::OnlineArt,
++        QuickRow::OnlineCheats,
++    ];
++
++    pub const MAIN: [QuickRow; 7] = [
+         QuickRow::General,
+         QuickRow::Screen,
+         QuickRow::Game,
+         QuickRow::About,
+-    ];
+-
+-    pub const GENERAL: [QuickRow; 6] = [
++        QuickRow::Shortcuts,
++        QuickRow::Network,
++        QuickRow::OnlineArt,
++    ];
++
++    pub const GENERAL: [QuickRow; 10] = [
+         QuickRow::Wallpaper,
+         QuickRow::WallpaperTint,
+         QuickRow::Theme,
++        QuickRow::Font,
+         QuickRow::Recents,
+         QuickRow::ShowTitles,
+         QuickRow::DateTime,
++        QuickRow::AutoOff,
++        QuickRow::LowBattery,
++        QuickRow::LowBatteryAt,
+     ];
+ 
+     pub const SCREEN: [QuickRow; 3] =
+@@ -140,9 +165,11 @@
+         QuickRow::EjectSave,
+     ];
+ 
+-    pub const PLAY: [QuickRow; 4] = [
++    pub const PLAY: [QuickRow; 6] = [
+         QuickRow::Resume,
+         QuickRow::States,
++        QuickRow::Cheats,
++        QuickRow::OnlineCheats,
+         QuickRow::Settings,
+         QuickRow::ExitGame,
+     ];
+@@ -184,11 +211,18 @@
+             | QuickRow::WallpaperTint
+             | QuickRow::DateTime
+             | QuickRow::Theme
++            | QuickRow::Font
+             | QuickRow::Recents
+-            | QuickRow::ShowTitles => &QuickRow::GENERAL,
+-            QuickRow::Resume | QuickRow::States | QuickRow::Settings | QuickRow::ExitGame => {
+-                &QuickRow::PLAY
+-            }
++            | QuickRow::ShowTitles
++            | QuickRow::AutoOff
++            | QuickRow::LowBattery
++            | QuickRow::LowBatteryAt => &QuickRow::GENERAL,
++            QuickRow::Resume
++            | QuickRow::States
++            | QuickRow::Cheats
++            | QuickRow::OnlineCheats
++            | QuickRow::Settings
++            | QuickRow::ExitGame => &QuickRow::PLAY,
+             QuickRow::PlayScreen | QuickRow::PlayGameplay => &QuickRow::SETTINGS,
+             QuickRow::Shader | QuickRow::ColourCorrection | QuickRow::Palette | QuickRow::Bezel => {
+                 &QuickRow::PLAY_SCREEN
+@@ -262,6 +296,8 @@
+         match self {
+             QuickRow::FastForward => "Fast Forward",
+             QuickRow::FastForwardSound => "Fast Forward Sound",
++            QuickRow::Network => "Network",
++            QuickRow::OnlineArt => "Online Art",
+             QuickRow::Screen => "Screen",
+             QuickRow::Rumble => "Rumble",
+             QuickRow::DateTime => "Date & Time",
+@@ -279,6 +315,7 @@
+             QuickRow::GbPalettes => "Palettes",
+             QuickRow::RunAhead => "Run-Ahead",
+             QuickRow::Theme => "Theme",
++            QuickRow::Font => "Font",
+             QuickRow::Wallpaper => "Wallpaper",
+             QuickRow::General => "General",
+             QuickRow::Recents => "Recents",
+@@ -286,6 +323,12 @@
+             QuickRow::WallpaperTint => "Wallpaper Tint",
+             QuickRow::Resume => "Resume",
+             QuickRow::States => "States",
++            QuickRow::Cheats => "Cheats",
++            QuickRow::OnlineCheats => "Online Cheats",
++            QuickRow::Shortcuts => "Shortcuts",
++            QuickRow::AutoOff => "Auto Power Off",
++            QuickRow::LowBattery => "Low Battery Alert",
++            QuickRow::LowBatteryAt => "Low Battery Level",
+             QuickRow::Settings => "Settings",
+             QuickRow::ExitGame => "Exit Game",
+             QuickRow::PlayScreen => "Screen",
+@@ -336,6 +379,7 @@
+ 
+ #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+ pub enum QuickValue {
++    Label(&'static str),
+     Speed2,
+     Speed3,
+     Speed4,
+@@ -354,10 +398,21 @@
+     Low,
+     Medium,
+     High,
++    Minutes3,
++    Minutes10,
++    Minutes30,
++    Never,
++    Pct5,
++    Pct10,
++    Pct15,
++    Pct20,
++    Pct25,
++    Pct30,
+ }
+ 
+ impl QuickValue {
+-    pub const ALL: [QuickValue; 18] = [
++    pub const ALL: [QuickValue; 29] = [
++        QuickValue::Label(""),
+         QuickValue::Speed2,
+         QuickValue::Speed3,
+         QuickValue::Speed4,
+@@ -376,14 +431,28 @@
+         QuickValue::Low,
+         QuickValue::Medium,
+         QuickValue::High,
++        QuickValue::Minutes3,
++        QuickValue::Minutes10,
++        QuickValue::Minutes30,
++        QuickValue::Never,
++        QuickValue::Pct5,
++        QuickValue::Pct10,
++        QuickValue::Pct15,
++        QuickValue::Pct20,
++        QuickValue::Pct25,
++        QuickValue::Pct30,
+     ];
+ 
+     pub fn index(self) -> usize {
+-        self as usize
++        QuickValue::ALL
++            .iter()
++            .position(|v| std::mem::discriminant(v) == std::mem::discriminant(&self))
++            .unwrap_or(0)
+     }
+ 
+     pub fn text(self) -> &'static str {
+         match self {
++            QuickValue::Label(text) => text,
+             QuickValue::Speed2 => "2×",
+             QuickValue::Speed3 => "3×",
+             QuickValue::Speed4 => "4×",
+@@ -402,6 +471,16 @@
+             QuickValue::Low => "25%",
+             QuickValue::Medium => "45%",
+             QuickValue::High => "65%",
++            QuickValue::Minutes3 => "3 min",
++            QuickValue::Minutes10 => "10 min",
++            QuickValue::Minutes30 => "30 min",
++            QuickValue::Never => "Never",
++            QuickValue::Pct5 => "5%",
++            QuickValue::Pct10 => "10%",
++            QuickValue::Pct15 => "15%",
++            QuickValue::Pct20 => "20%",
++            QuickValue::Pct25 => "25%",
++            QuickValue::Pct30 => "30%",
+         }
+     }
+ 
+@@ -570,6 +649,8 @@
+     pub row: QuickRow,
+     pub hidden: &'a [QuickRow],
+     pub values: [Option<QuickValue>; QuickRow::ALL.len()],
++    /// Texture for the 字体 row: rebuilt by the host when the face changes.
++    pub font_value: Option<(TexId, u32, u32)>,
+     pub clock: Option<[(TexId, u32, u32); 2]>,
+     pub wallpaper: Option<[(TexId, u32, u32); 2]>,
+     pub faces: Option<&'a QuickMenuFaces>,
+@@ -629,6 +710,7 @@
+                 }
+             }
+             let value = match row {
++                QuickRow::Font => self.font_value,
+                 QuickRow::DateTime => self.clock.map(|c| c[lit as usize]),
+                 QuickRow::Wallpaper => self.wallpaper.map(|c| c[lit as usize]),
+                 QuickRow::Palette => self.palette.map(|c| c[lit as usize]),
+@@ -698,13 +780,25 @@
+ }
+ 
+ pub fn quick_row_top(row: QuickRow, hidden: &[QuickRow]) -> f32 {
+-    let rows = QUICK_PITCH * row.shown(hidden).len() as f32;
++    let count = row.shown(hidden).len() as f32;
++    // Tighten the pitch when a page has more rows than fit on screen, so the
++    // last entries never run off the top edge.
++    let avail = LEGEND_Y - QUICK_TOP_MIN;
++    let pitch = if count > 1.0 {
++        QUICK_PITCH.min(avail / count)
++    } else {
++        QUICK_PITCH
++    };
++    let rows = pitch * count;
+     let top = match row.page() == QuickRow::PLAY_SCREEN {
+         true => LEGEND_Y - PANEL_GAP - rows,
+         false => (LEGEND_Y - rows) / 2.0,
+     };
+-    top + QUICK_PITCH * row.position(hidden) as f32
+-}
++    top + pitch * row.position(hidden) as f32
++}
++
++/// Top margin the row list is allowed to use before the pitch shrinks.
++const QUICK_TOP_MIN: f32 = 24.0;
+ 
+ fn push(out: &mut Vec<Draw>, tex: TexId, x: f32, y: f32, w: u32, h: u32) {
+     out.push(Draw::Tex {
+--- a/crates\slot-ui\src\text.rs
++++ b/crates\slot-ui\src\text.rs
+@@ -1,4 +1,4 @@
+-use std::sync::OnceLock;
++use std::sync::{Mutex, OnceLock};
+ 
+ use fontdue::{Font, FontSettings};
+ 
+@@ -10,10 +10,187 @@
+     pub tracking: f32,
+ }
+ 
++
++/// Simplified Chinese strings for the interface. Matched case-insensitively
++/// against the whole string drawn by the text layer.
++pub const LOCALE_ZHS: &[(&str, &str)] = &[
++    ("Fast Forward", "快进"),
++    ("Fast Forward Sound", "快进声音"),
++    ("Screen", "画面"),
++    ("Rumble", "震动"),
++    ("Date & Time", "日期与时间"),
++    ("About", "关于"),
++    ("Shader", "着色器"),
++    ("Color Correction", "色彩校正"),
++    ("Gameplay", "游戏内容"),
++    ("Auto Save on Eject", "退出时自动存档"),
++    ("Turbo Buttons", "连发按键"),
++    ("Rewind", "倒带"),
++    ("Palettes", "调色板"),
++    ("Run-Ahead", "预运行"),
++    ("Theme", "主题"),
++        ("Font", "字体"),
++    ("Wallpaper", "壁纸"),
++    ("General", "通用"),
++    ("Recents", "最近"),
++    ("Game Titles", "游戏标题"),
++    ("Wallpaper Tint", "壁纸色调"),
++    ("Resume", "继续游戏"),
++    ("States", "即时存档"),
++    ("Cheats", "金手指"),
++        ("Online Cheats", "在线金手指"),
++    ("Network", "网络"),
++    ("Online Art", "在线贴纸"),
++    ("Downloading label...", "正在下载贴纸..."),
++    ("Label downloaded", "贴纸已下载，重启后生效"),
++    ("No label found online", "在线未找到贴纸"),
++    ("Network", "网络"),
++    ("Downloading cheats...", "正在下载金手指..."),
++    ("Cheats downloaded", "金手指已下载"),
++        ("Font saved; applies next start", "字体已保存，重启后生效"),
++    ("No cheats found online", "在线未找到金手指"),
++    ("No Wi-Fi", "未连接 Wi-Fi"),
++    ("Shortcuts", "快捷键一览"),
++    ("Auto Power Off", "休眠自动关机"),
++    ("Low Battery Alert", "低电量提醒"),
++    ("Low Battery Level", "低电量阈值"),
++    ("Never", "永不"),
++    ("3 min", "3 分钟"),
++    ("10 min", "10 分钟"),
++    ("30 min", "30 分钟"),
++    ("Settings", "设置"),
++    ("Exit Game", "退出游戏"),
++    ("Palette", "调色板"),
++    ("Bezel", "边框"),
++    ("Game Boy Advance", "GBA"),
++    ("Game Boy Color", "GBC"),
++    ("Game Boy", "GB"),
++    ("On", "开"),
++    ("Off", "关"),
++    ("1 Frame", "1帧"),
++    ("Dark", "深色"),
++    ("Light", "浅色"),
++    ("Show", "显示"),
++    ("Hide", "隐藏"),
++    ("Back", "返回"),
++    ("Cancel", "取消"),
++    ("Choose", "选择"),
++    ("OK", "确定"),
++    ("Swap", "交换"),
++    ("Mode", "模式"),
++    ("Link", "联机"),
++    ("End Link", "结束联机"),
++    ("Linked", "已连接"),
++    ("Change", "更改"),
++    ("Open", "打开"),
++    ("Delete", "删除"),
++    ("Load", "读取"),
++    ("Restart", "重启"),
++    ("Power Off", "关机"),
++    ("Restarting", "正在重启"),
++    ("Powering Down", "正在关机"),
++    ("State Saved", "即时存档已保存"),
++    ("State Loaded", "即时存档已读取"),
++    ("Please switch to gpSP", "请切换到 gpSP"),
++    ("No link support", "不支持联机"),
++    ("Link ended", "联机已结束"),
++    ("Link was ended", "对方已结束联机"),
++    ("BIOS does not match", "BIOS 不匹配"),
++    ("Correction On", "色彩校正：开"),
++    ("Correction Off", "色彩校正：关"),
++    ("Shader: Off", "着色器：关"),
++    ("Shader: LCD3x", "着色器：LCD3x"),
++    ("Shader: Grid", "着色器：网格"),
++    ("Shader: Dot", "着色器：点阵"),
++    ("Shader: Simpletex", "着色器：纸感"),
++    ("Can't write to SD card", "无法写入存储卡"),
++    ("Progress is not being saved", "当前进度未能保存"),
++    ("set the clock", "设置时间"),
++    ("Bringing the radio up", "正在启动无线"),
++    ("Looking for the other player", "正在寻找另一位玩家"),
++    ("The radio did not come up", "无线启动失败"),
++    ("Nobody arrived", "未找到其他玩家"),
++    ("The other player vanished", "对方已断开"),
++    ("Cancelled", "已取消"),
++    ("Caching New Labels", "正在缓存新标签"),
++    ("Host", "主机"),
++    ("Join", "加入"),
++    ("Favorites", "收藏"),
++    ("None", "无"),
++    ("Random", "随机"),
++    ("Default", "默认"),
++    ("DEFAULT BLUR", "默认模糊"),
++    ("Auto", "自动"),
++    ("Autodetect", "自动检测"),
++    ("OFF", "关"),
++    ("ON", "开"),
++    ("Grayscale", "灰度"),
++    ("DMG Green", "经典绿"),
++    ("GB Pocket", "GB Pocket"),
++    ("GB Light", "GB背光"),
++    ("GBC Brown ↑", "棕色↑"),
++    ("GBC Red ↑A", "红色↑A"),
++    ("GBC Dark Brown ↑B", "深棕↑B"),
++    ("GBC Pale Yellow ↓", "淡黄↓"),
++    ("GBC Orange ↓A", "橙色↓A"),
++    ("GBC Yellow ↓B", "黄色↓B"),
++    ("GBC Blue ←", "蓝色←"),
++    ("GBC Dark Blue ←A", "深蓝←A"),
++    ("GBC Gray ←B", "灰色←B"),
++    ("GBC Green →", "绿色→"),
++    ("GBC Dark Green →A", "深绿→A"),
++    ("GBC Reverse →B", "反色→B"),
++];
++
++/// Translate a user-facing label into Simplified Chinese. Chinese text,
++/// file paths, ROM titles and everything else pass through unchanged.
++pub fn localize(text: &str) -> &str {
++    if !text.is_ascii() {
++        return text;
++    }
++    for (en, zh) in LOCALE_ZHS {
++        if text.eq_ignore_ascii_case(en) {
++            return zh;
++        }
++    }
++    text
++}
++
+ pub fn label_font() -> Option<&'static Font> {
++    if let Ok(pick) = OVERRIDE.lock() {
++        if let Some(font) = *pick {
++            return Some(font);
++        }
++    }
+     static FONT: OnceLock<Option<Font>> = OnceLock::new();
+     FONT.get_or_init(|| Font::from_bytes(LABEL_TTF, FontSettings::default()).ok())
+         .as_ref()
++}
++
++/// Selected face used by every label drawn through this module. A chosen
++/// font is leaked once per switch: the setting only changes on a deliberate
++/// menu action, so this cannot grow without bound in practice.
++static OVERRIDE: Mutex<Option<&'static Font>> = Mutex::new(None);
++
++/// Install a user font (TTF/OTF bytes). Returns false when the face cannot be
++/// parsed, in which case the previous font stays in place.
++pub fn set_font(bytes: Vec<u8>) -> bool {
++    let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) else {
++        return false;
++    };
++    let leaked: &'static Font = Box::leak(Box::new(font));
++    if let Ok(mut pick) = OVERRIDE.lock() {
++        *pick = Some(leaked);
++        return true;
++    }
++    false
++}
++
++/// Fall back to the embedded pixel font.
++pub fn use_builtin_font() {
++    if let Ok(mut pick) = OVERRIDE.lock() {
++        *pick = None;
++    }
+ }
+ 
+ pub fn fit(
+@@ -37,6 +214,7 @@
+     max_px: f32,
+     min_px: f32,
+ ) -> Layout {
++    let text = localize(text);
+     let upper = text.to_uppercase();
+     let mut px = max_px;
+     while px > min_px {
+@@ -67,6 +245,48 @@
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++pub fn fit_cased(
++    font: &Font,
++    text: &str,
++    max_w: f32,
++    max_h: f32,
++    max_lines: usize,
++    max_px: f32,
++    min_px: f32,
++) -> Layout {
++    let text = localize(text);
++    let upper = text.to_string();
++    let mut px = max_px;
++    while px > min_px {
++        let tracking = tracking_for(px);
++        let lines = wrap(font, &upper, px, tracking, max_w, false);
++        if lines.len() <= max_lines
++            && lines
++                .iter()
++                .all(|l| line_width(font, l, px, tracking) <= max_w)
++            && block_height(font, px, lines.len()) <= max_h
++        {
++            return Layout {
++                lines,
++                px,
++                tracking,
++            };
++        }
++        px -= 1.0;
++    }
++    let tracking = tracking_for(min_px);
++    Layout {
++        lines: wrap(font, &upper, min_px, tracking, max_w, true)
++            .into_iter()
++            .take(max_lines)
++            .collect(),
++        px: min_px,
++        tracking,
++    }
++}
++
++
+ pub fn draw_centred(dst: &mut [u8], dst_w: u32, dst_h: u32, layout: &Layout, colour: [u8; 3]) {
+     for (i, a) in coverage(dst_w, dst_h, layout).into_iter().enumerate() {
+         if a > 0 {
+@@ -114,6 +334,7 @@
+ }
+ 
+ pub fn line_width(font: &Font, line: &str, px: f32, tracking: f32) -> f32 {
++    let line = localize(line);
+     let mut w = 0.0;
+     let mut n = 0;
+     for ch in line.chars() {
+--- a/crates\slot-ui\src\toast.rs
++++ b/crates\slot-ui\src\toast.rs
+@@ -1,4 +1,4 @@
+-use slot_gfx::{Canvas, OUT_H};
++﻿use slot_gfx::{Canvas, OUT_H};
+ use slot_store::GbPalette;
+ 
+ use crate::hud::{HUD_INK, PLATE_H};
+@@ -8,6 +8,8 @@
+ 
+ #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+ pub enum Toast {
++    /// Font pick saved; the cached label atlases refresh on the next boot.
++    FontSaved,
+     StateSaved,
+     StateLoaded,
+     NeedsGpsp,
+@@ -23,11 +25,17 @@
+     ShaderDot,
+     ShaderSimpletex,
+     CardUnwritable,
++    CheatsDownloading,
++    CheatsDownloaded,
++    CheatsFailed,
++    ArtDownloading,
++    ArtDownloaded,
++    ArtFailed,
+     Palette(GbPalette),
+ }
+ 
+ impl Toast {
+-    const FIXED: [Toast; 15] = [
++    const FIXED: [Toast; 22] = [
+         Toast::StateSaved,
+         Toast::StateLoaded,
+         Toast::NeedsGpsp,
+@@ -43,6 +51,13 @@
+         Toast::ShaderDot,
+         Toast::ShaderSimpletex,
+         Toast::CardUnwritable,
++        Toast::CheatsDownloading,
++        Toast::CheatsDownloaded,
++        Toast::CheatsFailed,
++        Toast::ArtDownloading,
++        Toast::ArtDownloaded,
++        Toast::ArtFailed,
++        Toast::FontSaved,
+     ];
+ 
+     pub fn all() -> Vec<Toast> {
+@@ -87,6 +102,13 @@
+             Toast::ShaderDot => "Shader: Dot",
+             Toast::ShaderSimpletex => "Shader: Simpletex",
+             Toast::CardUnwritable => "Can't write to SD card",
++            Toast::CheatsDownloading => "Downloading cheats...",
++            Toast::CheatsDownloaded => "Cheats downloaded",
++            Toast::CheatsFailed => "No cheats found online",
++            Toast::ArtDownloading => "Downloading label...",
++            Toast::ArtDownloaded => "Label downloaded",
++            Toast::ArtFailed => "No label found online",
++            Toast::FontSaved => "Font saved; applies next start",
+             Toast::Palette(p) => p.label(),
+         }
+     }
+@@ -256,4 +278,4 @@
+             assert!(w <= s.w, "{:?} is {w} px wide in a {} px box", t, s.w);
+         }
+     }
+-}
++}--- a/crates\slot\src\app.rs
++++ b/crates\slot\src\app.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++﻿use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
+@@ -313,6 +313,25 @@
+     power_menu: Option<usize>,
+     power_menu_faces: Vec<(TexId, u32, u32)>,
+     core_picker: Option<CorePicker>,
++    cheats: Option<crate::cheat_panel::CheatPanel>,
++    /// Background online cheat lookup (libretro-database).
++    online_cheats: Option<std::sync::mpsc::Receiver<Result<crate::cheats::CheatSet, String>>>,
++    /// Cart the lookup belongs to, used to open the panel when it lands.
++    online_cart: Option<String>,
++    /// Background box-art download.
++    art_net: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
++    art_stem: Option<String>,
++    /// Wi-Fi settings overlay.
++    wifi: Option<crate::wifi_page::WifiPage>,
++    /// Background join result.
++    wifi_net: Option<std::sync::mpsc::Receiver<Result<crate::net::WifiStatus, String>>>,
++    /// Background network scan.
++    wifi_scan: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
++    wifi_status: Option<crate::net::WifiStatus>,
++    shortcuts: Option<crate::shortcuts::ShortcutsPage>,
++    letter_page: Option<crate::letter_page::LetterPage>,
++    /// Millisecond stamp of the last button press, for the idle power-off timer.
++    last_activity: Millis,
+     core_board_face: Option<TexId>,
+     core_interior_face: Option<TexId>,
+     core_lid_face: Option<TexId>,
+@@ -341,6 +360,11 @@
+     restarting: bool,
+     act_at: Millis,
+     root: Option<PathBuf>,
++    fonts: Vec<(&'static str, Option<PathBuf>)>,
++    font_pick: usize,
++    about_page: usize,
++    about_face: Option<TexId>,
++    font_value_face: Option<(TexId, u32, u32)>,
+     state: SlotState,
+     vol_before: Vec<(u8, bool, Millis)>,
+     snapshot: Option<Box<dyn Snapshot>>,
+@@ -372,6 +396,14 @@
+     ground: Option<TexId>,
+     blur: Option<TexId>,
+     wallpaper: Option<TexId>,
++    /// Per-cart backdrops: the selected cartridge's label, blurred. Set by the
++    /// frontend whenever the shelf selection changes; falls back to the
++    /// configured wallpaper when the cart has no label art.
++    cart_backdrop: Option<TexId>,
++    /// The backdrop that was showing just before the current one, plus when
++    /// the cross-fade towards the new one started (start millis, duration).
++    cart_backdrop_prev: Option<TexId>,
++    cart_backdrop_fade: Option<(u64, u64)>,
+     random_wallpaper: Option<Option<String>>,
+     battery_percent: slot_ui::Printed,
+     bolt: Option<TexId>,
+@@ -383,6 +415,11 @@
+     slot_letter: Option<char>,
+     shelf_named: Option<Millis>,
+     shelf_clock: slot_ui::Printed,
++    online_page: Option<crate::online_page::OnlinePage>,
++    online_explicit: bool,
++    wifi_auto: Option<std::sync::mpsc::Receiver<Result<crate::net::WifiStatus, String>>>,
++    wifi_icon_on: Option<TexId>,
++    wifi_icon_off: Option<TexId>,
+     hud: Hud,
+     screen: f32,
+     lift: f32,
+@@ -460,6 +497,18 @@
+             power_menu: None,
+             power_menu_faces: Vec::new(),
+             core_picker: None,
++            cheats: None,
++            online_cheats: None,
++            online_cart: None,
++            art_net: None,
++            art_stem: None,
++            wifi: None,
++            wifi_net: None,
++            wifi_scan: None,
++            wifi_status: None,
++            shortcuts: None,
++            letter_page: None,
++            last_activity: 0,
+             core_board_face: None,
+             core_interior_face: None,
+             core_lid_face: None,
+@@ -488,6 +537,11 @@
+             restarting: false,
+             act_at: 0,
+             root: None,
++            fonts: Vec::new(),
++            font_pick: 0,
++            about_page: 0,
++            about_face: None,
++            font_value_face: None,
+             state: SlotState::default(),
+             vol_before: Vec::new(),
+             snapshot: None,
+@@ -519,6 +573,9 @@
+             ground: None,
+             blur: None,
+             wallpaper: None,
++            cart_backdrop: None,
++            cart_backdrop_prev: None,
++            cart_backdrop_fade: None,
+             random_wallpaper: None,
+             battery_percent: slot_ui::Printed::default(),
+             bolt: None,
+@@ -530,6 +587,11 @@
+             slot_letter: None,
+             shelf_named: None,
+             shelf_clock: slot_ui::Printed::default(),
++            online_page: None,
++            online_explicit: false,
++            wifi_auto: None,
++            wifi_icon_on: None,
++            wifi_icon_off: None,
+             hud: Hud::new(),
+             screen: 0.0,
+             lift: 1.0,
+@@ -563,6 +625,10 @@
+         let mut app = App::new(carts);
+         app.root = Some(root.to_path_buf());
+         app.state = read_slot_state(root);
++        app.fonts = scan_fonts(root);
++        app.pick_saved_font(root);
++        app.apply_font();
++        crate::boot_time::mark("fonts");
+         app.restock_recents();
+         app.restock_favorites();
+         if let Some((at, i)) = app.remembered_seat() {
+@@ -575,6 +641,47 @@
+             app.start();
+         } else {
+             app.phase = clock_screen(system_secs(), 0, false);
++        }
++        if let Some(creds) = crate::net::load_credentials(root) {
++            if !creds.ssid.is_empty() && crate::net::wifi_available() {
++                let (tx, rx) = std::sync::mpsc::channel();
++                let root2 = root.to_path_buf();
++                std::thread::Builder::new()
++                    .name("slot-wifi-auto".into())
++                    .spawn(move || {
++                        let result = crate::net::join(
++                            &root2,
++                            &creds,
++                            std::time::Duration::from_secs(25),
++                        )
++                        .map_err(|e| e.to_string());
++                        let _ = tx.send(result);
++                    })
++                    .ok();
++                app.wifi_auto = Some(rx);
++                eprintln!("slot: wifi: auto connect armed");
++            }
++        }
++        if std::env::var_os("SLOT_ONLINE_PAGE").is_some() {
++            let mut page = crate::online_page::OnlinePage::new();
++            if std::env::var_os("SLOT_ONLINE_FAIL").is_some() {
++                let mut detail = vec!["下载失败: 404 not found (演示)".to_string()];
++                detail.extend(crate::net::diagnose());
++                page.set_status("本作在线暂无金手指", detail);
++            }
++            app.online_page = Some(page);
++        }
++        if std::env::var_os("SLOT_WIFI_OPEN").is_some() {
++            app.open_wifi();
++        }
++        if std::env::var_os("SLOT_PLAY_MENU").is_some() {
++            app.phase = Phase::QuickMenu {
++                row: QuickRow::Resume,
++            };
++        }
++        if std::env::var_os("SLOT_ABOUT2").is_some() {
++            app.phase = Phase::About;
++            app.about_page = 1;
+         }
+         app
+     }
+@@ -702,6 +809,9 @@
+     }
+ 
+     fn slot_name_alpha(&self) -> f32 {
++        if self.state.show_titles {
++            return 0.0;
++        }
+         let Some(at) = self.shelf_named else {
+             return 0.0;
+         };
+@@ -858,7 +968,14 @@
+     }
+ 
+     pub fn quick_value(&self, row: QuickRow) -> Option<QuickValue> {
++        if row == QuickRow::Font {
++            return Some(QuickValue::Label(self.font_label()));
++        }
+         match row {
++            QuickRow::Network => None,
++            QuickRow::OnlineArt => None,
++            QuickRow::OnlineCheats => None,
++            QuickRow::Font => Some(QuickValue::Label(self.font_label())),
+             QuickRow::Shader | QuickRow::ColourCorrection => {
+                 self.quick_value(self.playing_row(row))
+             }
+@@ -876,6 +993,11 @@
+             QuickRow::GbShader => Some(shader_value(self.state.shader_gb)),
+             QuickRow::GbcShader => Some(shader_value(self.state.shader_gbc)),
+             QuickRow::Rumble => Some(QuickValue::flag(self.state.rumble)),
++            QuickRow::Cheats => None,
++            QuickRow::Shortcuts => None,
++            QuickRow::AutoOff => Some(auto_off_value(self.state.auto_off_min)),
++            QuickRow::LowBattery => Some(QuickValue::flag(self.state.low_batt_alert)),
++            QuickRow::LowBatteryAt => Some(pct_value(self.state.low_batt_at)),
+             QuickRow::EjectSave => Some(QuickValue::flag(self.state.eject_save)),
+             QuickRow::Turbo => Some(QuickValue::flag(self.state.turbo)),
+             QuickRow::Rewind => Some(QuickValue::flag(self.state.rewind)),
+@@ -912,6 +1034,7 @@
+             | QuickRow::Settings
+             | QuickRow::ExitGame
+             | QuickRow::PlayScreen
++            | QuickRow::Shortcuts
+             | QuickRow::PlayGameplay
+             | QuickRow::Palette
+             | QuickRow::ScreenGba
+@@ -1081,6 +1204,61 @@
+     }
+ 
+     fn draw_background(&self, out: &mut Vec<Draw>) {
++        // On the shelf the backdrop follows the highlighted cartridge: its label
++        // art, blurred, tinted down so the shelf stays legible.
++        self.draw_wallpaper(out);
++        if !matches!(self.phase, Phase::Shelf) {
++            return;
++        }
++        if self.wifi.is_some()
++            || self.cheats.is_some()
++            || self.shortcuts.is_some()
++            || self.letter_page.is_some()
++            || self.online_page.is_some()
++        {
++            return;
++        }
++        let fade = self.cart_backdrop_fade.map(|(at, dur)| {
++            ((self.now().saturating_sub(at)) as f32 / dur.max(1) as f32).clamp(0.0, 1.0)
++        });
++        let scrim = |alpha: f32, out: &mut Vec<Draw>| {
++            out.push(Draw::Rect {
++                x: 0.0,
++                y: 0.0,
++                w: self.canvas().w,
++                h: OUT_H as f32,
++                colour: [0.0, 0.0, 0.0, alpha],
++            });
++        };
++        match (self.cart_backdrop, self.cart_backdrop_prev, fade) {
++            // Fading from the previous cart's backdrop into the new one.
++            //
++            // The outgoing backdrop is drawn fully opaque and the incoming one
++            // fades in on top of it. Compositing two half-transparent layers
++            // over the wallpaper would leak the wallpaper through the middle
++            // of the fade (alpha * (1 - alpha) of it), which shows up as a
++            // flash of the desktop wallpaper. Layering instead makes every
++            // pixel a convex mix of the two backdrops only.
++            (Some(face), Some(prev), Some(t)) if t < 1.0 => {
++                self.draw_ground_alpha(prev, 1.0, out);
++                self.draw_ground_alpha(face, t, out);
++                scrim(0.42, out);
++            }
++            (Some(face), _, _) => {
++                self.draw_ground_alpha(face, 1.0, out);
++                scrim(0.42, out);
++            }
++            // The new cart has no label art: fade the old backdrop out onto the
++            // wallpaper instead of cutting.
++            (None, Some(prev), Some(t)) if t < 1.0 => {
++                self.draw_ground_alpha(prev, 1.0 - t, out);
++                scrim(0.42 * (1.0 - t), out);
++            }
++            _ => {}
++        }
++    }
++
++    fn draw_wallpaper(&self, out: &mut Vec<Draw>) {
+         let face = match &self.state.wallpaper {
+             WallpaperPick::None => None,
+             WallpaperPick::Default => self.ground,
+@@ -1185,6 +1363,29 @@
+         self.wallpaper = Some(face);
+     }
+ 
++    pub fn set_cart_backdrop(&mut self, face: Option<TexId>, prev: Option<TexId>, fade_ms: Option<u64>) {
++        self.cart_backdrop = face;
++        self.cart_backdrop_prev = prev;
++        self.cart_backdrop_fade = fade_ms.map(|dur| (self.now(), dur));
++    }
++
++    fn draw_ground_alpha(&self, tex: TexId, alpha: f32, out: &mut Vec<Draw>) {
++        out.push(Draw::Part {
++            x: 0.0,
++            y: 0.0,
++            w: self.canvas().w,
++            h: OUT_H as f32,
++            tex,
++            alpha,
++            uv: self.canvas().window(OUT_W as f32),
++        });
++    }
++
++    pub fn selected_cart(&self) -> Option<&Cart> {
++        let shelf = self.shelf();
++        shelf.carts.get(shelf.index)
++    }
++
+     pub fn set_bolt_face(&mut self, bolt: TexId) {
+         self.bolt = Some(bolt);
+     }
+@@ -1229,14 +1430,11 @@
+     }
+ 
+     fn title_alpha(&self) -> f32 {
+-        if !self.state.show_titles || (self.name_pending && self.slot_text().is_some()) {
+-            return 0.0;
+-        }
+-        let named = self.shelf_named.map(|at| self.now().saturating_sub(at));
+-        if named.is_some_and(|t| t < SLOT_NAME_IN_MS + SLOT_NAME_HOLD_MS) {
+-            return 0.0;
+-        }
+-        1.0 - self.slot_name_alpha() / SLOT_NAME_ALPHA
++        if self.state.show_titles {
++            1.0
++        } else {
++            0.0
++        }
+     }
+ 
+     pub fn shelf_platform_name(&self) -> Option<&'static str> {
+@@ -1246,6 +1444,15 @@
+ 
+     pub fn set_battery_percent_face(&mut self, face: TexId, w: u32) {
+         self.battery_percent = slot_ui::Printed::new(face, w);
++    }
++
++    pub fn wifi_icons(&self) -> (Option<TexId>, Option<TexId>) {
++        (self.wifi_icon_on, self.wifi_icon_off)
++    }
++
++    pub fn set_wifi_icons(&mut self, on: TexId, off: TexId) {
++        self.wifi_icon_on = Some(on);
++        self.wifi_icon_off = Some(off);
+     }
+ 
+     pub fn set_shelf_clock_face(&mut self, face: TexId, w: u32) {
+@@ -1779,7 +1986,29 @@
+         self.battery
+     }
+ 
++    /// Saves a PNG of the current frame into <root>/Screenshots, so the last
++    /// picture stays around after the console powers itself off.
++    fn save_shutdown_shot(&mut self) {
++        let (Some(root), Some(snapshot)) = (self.root.as_ref(), self.snapshot.as_ref()) else {
++            return;
++        };
++        let Some(png) = snapshot.thumb() else {
++            return;
++        };
++        let dir = root.join("Screenshots");
++        if std::fs::create_dir_all(&dir).is_err() {
++            return;
++        }
++        let stamp = format!("{:010}", self.wall_secs());
++        let path = dir.join(format!("{stamp}.png"));
++        match std::fs::write(&path, &png) {
++            Ok(()) => eprintln!("slot: poweroff: saved {}", path.display()),
++            Err(e) => eprintln!("slot: poweroff: screenshot failed: {e}"),
++        }
++    }
++
+     pub fn poweroff(&mut self) {
++        self.save_shutdown_shot();
+         self.settle_saves();
+         if let Some(power) = &mut self.power {
+             power.poweroff();
+@@ -1787,6 +2016,10 @@
+     }
+ 
+     pub fn apply(&mut self, action: Action) {
++        if std::env::var_os("SLOT_ACTION_DEBUG").is_some() {
++            eprintln!("slot: action {:?} in {:?}", action, self.phase);
++        }
++        self.last_activity = self.now();
+         self.track_held_dir(action);
+         if self.power_menu.is_some() {
+             match action {
+@@ -1841,13 +2074,32 @@
+             Action::GbaUp(Btn::Right) => self.shelf_mut().release_right(),
+             _ => {}
+         }
++        if self.wifi.is_some() {
++            self.wifi_input(action);
++            return;
++        }
+         if self.game_menu.is_some() {
+             return self.game_menu_input(action);
++        }
++        if self.online_page.is_some() {
++            self.online_input(action);
++            return;
++        }
++        if self.cheats.is_some() {
++            self.cheat_input(action);
++            return;
++        }
++        if self.shortcuts.is_some() {
++            self.shortcut_input(action);
++            return;
+         }
+         if let (Some(row), Phase::Playing { .. }) = (self.in_game_menu, &self.phase) {
+             if action != Action::Eject {
+                 return self.in_game_menu_input(row, action);
+             }
++        }
++        if self.letter_page.is_some() {
++            return self.letter_input(action);
+         }
+         let now = self.now();
+         match self.phase {
+@@ -1873,6 +2125,13 @@
+                 Action::GbaDown(Btn::L1) => self.switch_shelf(-1),
+                 Action::GbaDown(Btn::R1) => self.switch_shelf(1),
+                 Action::GbaDown(Btn::Y) => self.toggle_favorite(),
++                // X and Select walk the shelf by first letter, like the X key
++                // in the 1.6 Chinese build.
++                Action::GbaDown(Btn::X) => {
++                    eprintln!("slot: shelf: X pressed, carts={}", self.shelf().carts.len());
++                    self.open_letter_search();
++                }
++                Action::GbaDown(Btn::Select) => self.start_label_fetch(),
+                 _ => {}
+             },
+             Phase::Inserting { .. } if action == Action::Eject => self.eject(),
+@@ -1907,6 +2166,11 @@
+                     row: QuickRow::About,
+                 }
+             }
++            Phase::About => match action {
++                Action::ShelfLeft | Action::GbaDown(Btn::Left) => self.about_page = 0,
++                Action::ShelfRight | Action::GbaDown(Btn::Right) => self.about_page = 1,
++                _ => {}
++            },
+             Phase::QuickMenu { row } => self.quick_menu_input(row, action),
+             _ => {}
+         }
+@@ -1956,6 +2220,9 @@
+         match row {
+             QuickRow::Resume => self.in_game_menu = None,
+             QuickRow::States => self.open_states(),
++            QuickRow::Cheats => self.open_cheats(),
++            QuickRow::OnlineCheats => self.open_online_cheats(),
++            QuickRow::Shortcuts => self.open_shortcuts(),
+             QuickRow::ExitGame => self.eject(),
+             _ => {
+                 if let Some(child) = row.child() {
+@@ -1998,12 +2265,580 @@
+         }
+     }
+ 
++    /// Debug aid for the desktop window: open the cheat list once a game is up.
++    pub fn preview_cheats(&mut self) {
++        if self.cheats.is_none() {
++            self.open_cheats();
++        }
++    }
++
++    fn open_cheats(&mut self) {
++        self.in_game_menu = None;
++        let Some(root) = self.root().map(Path::to_path_buf) else {
++            return;
++        };
++        let Some(cart) = self.selected_cart() else {
++            return;
++        };
++        let cart = cart.clone();
++        match crate::cheats::CheatSet::load(&root, &cart, self.core) {
++            Some(set) => {
++                eprintln!(
++                    "slot: cheats: {} entries in {}",
++                    set.cheats.len(),
++                    set.path.display()
++                );
++                self.cheats = Some(crate::cheat_panel::CheatPanel::new(set));
++            }
++            None => {
++                eprintln!("slot: cheats: no .cht for {}", cart.stem);
++                self.start_online_cheats();
++            }
++        }
++    }
++
++    pub fn tick_online_page(&mut self) {
++        if let Some(page) = &mut self.online_page {
++            page.tick();
++        }
++    }
++
++    fn open_online_cheats(&mut self) {
++        self.in_game_menu = None;
++        self.online_explicit = true;
++        self.online_page = Some(crate::online_page::OnlinePage::new());
++        self.start_online_cheats();
++    }
++
++    /// Kick off a libretro-database lookup in a worker thread.
++    fn start_online_cheats(&mut self) {
++        if let Some(root) = self.root() {
++            crate::net::persist_diag(root, "cheats-start");
++        }
++        if self.online_cheats.is_some() {
++            return;
++        }
++        let Some(root) = self.root().map(Path::to_path_buf) else {
++            return;
++        };
++        let Some(cart) = self.selected_cart().cloned() else {
++            return;
++        };
++        if !crate::net::http_tool() {
++            self.hud.toast(Toast::CheatsFailed, self.now());
++            return;
++        }
++        let core = self.core;
++        self.hud.toast(Toast::CheatsDownloading, self.now());
++        self.online_cart = Some(cart.stem.clone());
++        let (tx, rx) = std::sync::mpsc::channel();
++        let _ = std::thread::Builder::new()
++            .name("slot-cheats".to_string())
++            .spawn(move || {
++                let result = crate::online::fetch_for_cart(&root, &cart, core).and_then(|path| {
++                    crate::cheats::CheatSet::load(&root, &cart, core)
++                        .ok_or_else(|| format!("下载的文件无法解析: {}", path.display()))
++                });
++                let _ = tx.send(result);
++            });
++        self.online_cheats = Some(rx);
++    }
++
++    /// Called once per frame; opens the panel when a lookup finishes.
++    pub fn poll_online_cheats(&mut self) {
++        let Some(rx) = &self.online_cheats else {
++            return;
++        };
++        match rx.try_recv() {
++            Ok(Ok(set)) => {
++                eprintln!(
++                    "slot: cheats: online {} entries in {}",
++                    set.cheats.len(),
++                    set.path.display()
++                );
++                if self.online_explicit {
++                    if let Some(page) = &mut self.online_page {
++                        page.mark_ready(set);
++                    } else {
++                        self.cheats = Some(crate::cheat_panel::CheatPanel::new(set));
++                    }
++                } else {
++                    self.cheats = Some(crate::cheat_panel::CheatPanel::new(set));
++                    self.hud.toast(Toast::CheatsDownloaded, self.now());
++                }
++                self.online_explicit = false;
++                self.online_cheats = None;
++            }
++            Ok(Err(why)) => {
++                eprintln!("slot: cheats: online: {why}");
++                if self.online_explicit {
++                    if let Some(root) = self.root() {
++                        crate::net::persist_diag(root, "cheats");
++                    }
++                    let ready = crate::net::online_ready();
++                    let mut detail = vec![why.clone()];
++                    detail.extend(
++                        crate::net::diagnose()
++                            .into_iter()
++                            .filter(|l| !l.starts_with("时钟"))
++                            .take(3),
++                    );
++                    let status = if ready {
++                        "没找到这个游戏的金手指"
++                    } else {
++                        "未连接网络：先到「网络」里连 Wi-Fi"
++                    };
++                    if let Some(page) = &mut self.online_page {
++                        page.set_status(status, detail);
++                    }
++                    self.online_explicit = false;
++                } else {
++                    self.hud.toast(Toast::CheatsFailed, self.now());
++                }
++                self.online_cheats = None;
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                self.online_cheats = None;
++            }
++        }
++    }
++
++    fn start_label_fetch(&mut self) {
++        if self.art_net.is_some() {
++            return;
++        }
++        let Some(root) = self.root().map(Path::to_path_buf) else {
++            return;
++        };
++        let Some(cart) = self.selected_cart().cloned() else {
++            return;
++        };
++        if !crate::net::http_tool() {
++            self.hud.toast(Toast::ArtFailed, self.now());
++            return;
++        }
++        self.hud
++            .toast(Toast::ArtDownloading, self.now());
++        let stem = cart.stem.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let _ = std::thread::Builder::new()
++            .name("slot-art".to_string())
++            .spawn(move || {
++                let result = crate::online::fetch_label(&root, &cart).map_err(|e| e.to_string());
++                let _ = tx.send(result);
++            });
++        self.art_net = Some(rx);
++        self.art_stem = Some(stem);
++    }
++
++    /// Called once per frame; reports the box-art download.
++    pub fn poll_online_art(&mut self) {
++        let Some(rx) = &self.art_net else {
++            return;
++        };
++        match rx.try_recv() {
++            Ok(Ok(path)) => {
++                eprintln!("slot: online: art saved {}", path.display());
++                self.hud.toast(Toast::ArtDownloaded, self.now());
++                self.art_net = None;
++            }
++            Ok(Err(why)) => {
++                eprintln!("slot: online: art failed: {why}");
++                self.hud.toast(Toast::ArtFailed, self.now());
++                self.art_net = None;
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.art_net = None,
++        }
++    }
++
++    fn start_label_fetch_placeholder(&mut self) {}
++
++    fn open_wifi(&mut self) {
++        let Some(root) = self.root().map(Path::to_path_buf) else {
++            return;
++        };
++        let creds = crate::net::load_credentials(&root).unwrap_or_default();
++        let mut page = crate::wifi_page::WifiPage::new(creds.ssid, creds.psk);
++        if let Some(status) = &self.wifi_status {
++            page.status = if status.connected() {
++                format!("已连接 {} ({})", status.ssid, status.ip)
++            } else if status.state.is_empty() {
++                "未连接".to_string()
++            } else {
++                status.state.clone()
++            };
++        }
++        self.wifi = Some(page);
++        self.start_wifi_scan();
++    }
++
++    fn wifi_input(&mut self, action: Action) {
++        let before_ssid = self.wifi.as_ref().map(|page| page.ssid.clone());
++        let command = {
++            let Some(page) = &mut self.wifi else {
++                return;
++            };
++            let key = match action {
++                Action::GbaDown(Btn::Up) => crate::wifi_page::WifiKey::Up,
++                Action::GbaDown(Btn::Down) => crate::wifi_page::WifiKey::Down,
++                Action::GbaDown(Btn::Left) => crate::wifi_page::WifiKey::Left,
++                Action::GbaDown(Btn::Right) => crate::wifi_page::WifiKey::Right,
++                Action::GbaDown(Btn::A) | Action::Insert => crate::wifi_page::WifiKey::A,
++                Action::GbaDown(Btn::B) => crate::wifi_page::WifiKey::B,
++                _ => return,
++            };
++            page.press(key)
++        };
++        let known = self
++            .root()
++            .map(crate::net::known_passwords)
++            .unwrap_or_default();
++        if let Some(page) = &mut self.wifi {
++            if Some(&page.ssid) != before_ssid.as_ref() {
++                page.psk = known
++                    .into_iter()
++                    .find(|(ssid, _)| *ssid == page.ssid)
++                    .map(|(_, psk)| psk)
++                    .unwrap_or_default();
++                page.editing = Some(1);
++                page.dirty = true;
++            }
++        }
++        match command {
++            crate::wifi_page::WifiCommand::None => {}
++            crate::wifi_page::WifiCommand::Close => self.wifi = None,
++            crate::wifi_page::WifiCommand::Connect => self.start_wifi_join(),
++            crate::wifi_page::WifiCommand::Rescan => self.start_wifi_scan(),
++        }
++    }
++
++    fn start_wifi_scan(&mut self) {
++        if self.wifi_scan.is_some() {
++            return;
++        }
++        if let Some(page) = &mut self.wifi {
++            page.scanning = true;
++            page.status = "正在扫描…".to_string();
++            page.dirty = true;
++        }
++        let (tx, rx) = std::sync::mpsc::channel();
++        self.wifi_scan = Some(rx);
++        let _ = std::thread::Builder::new()
++            .name("slot-wifi-scan".to_string())
++            .spawn(move || {
++                let result = match std::env::var("SLOT_WIFI_FAKE") {
++                    Ok(list) => Ok(list
++                        .split(',')
++                        .map(|s| s.trim().to_string())
++                        .filter(|s| !s.is_empty())
++                        .collect()),
++                    Err(_) => crate::net::scan(std::time::Duration::from_secs(12))
++                        .map_err(|e| e.to_string()),
++                };
++                let _ = tx.send(result);
++            });
++    }
++
++    /// Called once per frame while the Wi-Fi page is open.
++    pub fn poll_wifi_scan(&mut self) {
++        let Some(rx) = &self.wifi_scan else {
++            return;
++        };
++        match rx.try_recv() {
++            Ok(Ok(nets)) => {
++                eprintln!("slot: wifi: scan found {} networks", nets.len());
++                if let Some(page) = &mut self.wifi {
++                    page.set_nets(nets);
++                }
++                self.wifi_scan = None;
++            }
++            Ok(Err(why)) => {
++                eprintln!("slot: wifi: scan: {why}");
++                if let Some(page) = &mut self.wifi {
++                    page.scan_failed(why);
++                }
++                self.wifi_scan = None;
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                self.wifi_scan = None;
++            }
++        }
++    }
++
++    fn start_wifi_join(&mut self) {
++        if self.wifi_net.is_some() {
++            return;
++        }
++        let Some(root) = self.root().map(Path::to_path_buf) else {
++            return;
++        };
++        let Some(page) = &mut self.wifi else {
++            return;
++        };
++        let ssid = page.ssid.trim().to_string();
++        if ssid.is_empty() {
++            page.status = "请先填写 SSID".to_string();
++            return;
++        }
++        let creds = crate::net::Credentials {
++            ssid,
++            psk: page.psk.clone(),
++        };
++        page.busy = true;
++        page.status = "正在连接…".to_string();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let _ = std::thread::Builder::new()
++            .name("slot-wifi".to_string())
++            .spawn(move || {
++                let result = crate::net::join(&root, &creds, std::time::Duration::from_secs(30))
++                    .map_err(|e| e.to_string());
++                let _ = tx.send(result);
++            });
++        self.wifi_net = Some(rx);
++    }
++
++    /// Called once per frame; folds the join result back into the page.
++    pub fn poll_wifi(&mut self) {
++        if let Some(rx) = self.wifi_auto.take() {
++            match rx.try_recv() {
++                Ok(Ok(status)) => {
++                    eprintln!("slot: wifi: auto connected {} {}", status.ssid, status.ip);
++                    self.wifi_status = Some(status);
++                }
++                Ok(Err(why)) => eprintln!("slot: wifi: auto connect failed: {why}"),
++                Err(std::sync::mpsc::TryRecvError::Empty) => self.wifi_auto = Some(rx),
++                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
++            }
++        }
++        let Some(rx) = &self.wifi_net else {
++            return;
++        };
++        match rx.try_recv() {
++            Ok(Ok(status)) => {
++                eprintln!("slot: wifi: connected {} {}", status.ssid, status.ip);
++                if let Some(page) = &mut self.wifi {
++                    page.busy = false;
++                    page.status = format!("已连接 {} ({})", status.ssid, status.ip);
++                    page.dirty = true;
++                }
++                self.wifi_status = Some(status);
++                self.wifi_net = None;
++            }
++            Ok(Err(why)) => {
++                eprintln!("slot: wifi: {why}");
++                if let Some(page) = &mut self.wifi {
++                    page.busy = false;
++                    page.status = format!("连接失败：{why}");
++                    page.dirty = true;
++                }
++                self.wifi_net = None;
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                self.wifi_net = None;
++            }
++        }
++    }
++
++    pub fn wifi_page(&self) -> Option<&crate::wifi_page::WifiPage> {
++        self.wifi.as_ref()
++    }
++
++    pub fn set_wifi_face(&mut self, tex: TexId) {
++        if let Some(page) = &mut self.wifi {
++            page.tex = Some(tex);
++            page.dirty = false;
++        }
++    }
++
++    fn cheat_input(&mut self, action: Action) {        let Some(panel) = &mut self.cheats else {
++            return;
++        };
++        match action {
++            Action::GbaDown(Btn::Up) => panel.up(),
++            Action::GbaDown(Btn::Down) => panel.down(),
++            Action::GbaDown(Btn::Left) => panel.page(-1),
++            Action::GbaDown(Btn::Right) => panel.page(1),
++            Action::GbaDown(Btn::A) | Action::Insert => panel.toggle(),
++            Action::GbaDown(Btn::B) | Action::QuickMenu | Action::PowerTap => {
++                self.cheats = None;
++            }
++            _ => {}
++        }
++    }
++
++    pub fn cheat_panel(&self) -> Option<&crate::cheat_panel::CheatPanel> {
++        self.cheats.as_ref()
++    }
++
++    /// True while the online-cheat status page is up; the session pauses the
++    /// emulator then, so games do not keep advancing behind the overlay.
++    pub fn online_busy(&self) -> bool {
++        self.online_page.is_some()
++    }
++
++    pub fn online_page_ref(&self) -> Option<&crate::online_page::OnlinePage> {
++        self.online_page.as_ref()
++    }
++
++    pub fn online_page_face(&self) -> Option<TexId> {
++        self.online_page.as_ref().and_then(|page| page.tex)
++    }
++
++    pub fn set_online_face(&mut self, tex: TexId) {
++        if let Some(page) = &mut self.online_page {
++            page.tex = Some(tex);
++            page.dirty = false;
++        }
++    }
++
++    fn online_input(&mut self, action: Action) {
++        match action {
++            Action::GbaDown(Btn::A) | Action::Insert => {
++                if let Some(page) = &mut self.online_page {
++                    if let Some(set) = page.set.take() {
++                        self.cheats = Some(crate::cheat_panel::CheatPanel::new(set));
++                        self.online_page = None;
++                    }
++                }
++            }
++            Action::GbaDown(Btn::B) | Action::QuickMenu | Action::PowerTap => {
++                self.online_page = None;
++            }
++            _ => {}
++        }
++    }
++
++    pub fn set_cheat_face(&mut self, tex: TexId) {
++        if let Some(panel) = &mut self.cheats {
++            panel.tex = Some(tex);
++            panel.dirty = false;
++        }
++    }
++
++    fn open_letter_search(&mut self) {
++        let mut groups: Vec<(String, usize)> = Vec::new();
++        {
++            let mut seen = std::collections::HashSet::new();
++            for (i, cart) in self.shelf().carts.iter().enumerate() {
++                let name = if cart.title.trim().is_empty() {
++                    cart.stem.as_str()
++                } else {
++                    cart.title.as_str()
++                };
++                let Some(ch) = name
++                    .chars()
++                    .find(|c| c.is_alphabetic())
++                    .or_else(|| name.chars().find(|c| c.is_alphanumeric()))
++                else {
++                    continue;
++                };
++                let key = if ch.is_ascii_alphabetic() {
++                    ch.to_ascii_uppercase().to_string()
++                } else if let Some(initial) = crate::pinyin::initial(ch) {
++                    initial.to_string()
++                } else if ch.is_ascii_digit() {
++                    "#".to_string()
++                } else {
++                    continue;
++                };
++                if seen.insert(key.clone()) {
++                    groups.push((key, i));
++                }
++            }
++        }
++        eprintln!("slot: shelf: letter groups={}", groups.len());
++        if groups.is_empty() {
++            return;
++        }
++        groups.sort_by(|a, b| {
++            let rank = |k: &str| if k == "#" { 1 } else { 0 };
++            rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0))
++        });
++        eprintln!("slot: shelf: letter sheet with {} groups", groups.len());
++        self.letter_page = Some(crate::letter_page::LetterPage::new(groups));
++    }
++
++    fn letter_input(&mut self, action: Action) {
++        let Some(page) = &mut self.letter_page else {
++            return;
++        };
++        match action {
++            Action::GbaDown(Btn::Up) => page.up(),
++            Action::GbaDown(Btn::Down) => page.down(),
++            Action::GbaDown(Btn::Left) => page.left(),
++            Action::GbaDown(Btn::Right) => page.right(),
++            Action::GbaDown(Btn::A) => {
++                let target = page.selected_index();
++                self.letter_page = None;
++                if let Some(i) = target {
++                    self.shelf_mut().select(i);
++                }
++            }
++            Action::GbaDown(Btn::B) | Action::QuickMenu | Action::PowerTap => {
++                self.letter_page = None;
++            }
++            _ => {}
++        }
++    }
++
++    pub fn letter_page(&self) -> Option<&crate::letter_page::LetterPage> {
++        self.letter_page.as_ref()
++    }
++
++    pub fn set_letter_face(&mut self, tex: slot_gfx::TexId) {
++        if let Some(page) = &mut self.letter_page {
++            page.tex = Some(tex);
++        }
++    }
++
++    pub fn letter_page_clean(&mut self) {
++        if let Some(page) = &mut self.letter_page {
++            page.dirty = false;
++        }
++    }
++
++    fn open_shortcuts(&mut self) {
++        self.shortcuts = Some(crate::shortcuts::ShortcutsPage::new());
++    }
++
++    fn shortcut_input(&mut self, action: Action) {
++        match action {
++            Action::GbaDown(Btn::A) | Action::GbaDown(Btn::B) | Action::QuickMenu
++            | Action::PowerTap => {
++                self.shortcuts = None;
++            }
++            _ => {}
++        }
++    }
++
++    pub fn shortcut_page(&self) -> Option<&crate::shortcuts::ShortcutsPage> {
++        self.shortcuts.as_ref()
++    }
++
++    pub fn set_shortcut_face(&mut self, tex: TexId) {
++        if let Some(page) = &mut self.shortcuts {
++            page.tex = Some(tex);
++        }
++    }
++
+     fn open_quick_row(&mut self, row: QuickRow) {
++        if row == QuickRow::Font {
++            return;
++        }
+         match row {
++            QuickRow::Network => self.open_wifi(),
++            QuickRow::OnlineArt => self.start_label_fetch(),
++            QuickRow::OnlineCheats => self.open_online_cheats(),
++            QuickRow::Font => return self.cycle_font(true),
+             QuickRow::DateTime => {
+                 self.phase = clock_screen(self.utc_secs(), self.state.utc_offset_min, true);
+             }
+             QuickRow::About => self.phase = Phase::About,
++            QuickRow::Shortcuts => self.open_shortcuts(),
+             QuickRow::Screen
+             | QuickRow::Game
+             | QuickRow::General
+@@ -2039,6 +2874,7 @@
+             | QuickRow::Settings
+             | QuickRow::ExitGame
+             | QuickRow::PlayScreen
++            | QuickRow::Shortcuts
+             | QuickRow::PlayGameplay
+             | QuickRow::Shader
+             | QuickRow::ColourCorrection
+@@ -2046,6 +2882,10 @@
+             | QuickRow::GbBezel
+             | QuickRow::GbcBezel
+             | QuickRow::GbaBezel
++            | QuickRow::Cheats
++            | QuickRow::AutoOff
++            | QuickRow::LowBattery
++            | QuickRow::LowBatteryAt
+             | QuickRow::Bezel => {}
+         }
+     }
+@@ -2090,6 +2930,10 @@
+         }
+         let s = &mut self.state;
+         match row {
++            QuickRow::Network => return,
++            QuickRow::OnlineArt => return,
++            QuickRow::OnlineCheats => return,
++            QuickRow::Font => return self.cycle_font(right),
+             QuickRow::FastForward => {
+                 let to = ff_next(s.ff_speed, right);
+                 if to == s.ff_speed {
+@@ -2133,6 +2977,9 @@
+             }
+             QuickRow::Rumble => s.rumble = !s.rumble,
+             QuickRow::EjectSave => s.eject_save = !s.eject_save,
++            QuickRow::AutoOff => s.auto_off_min = auto_off_minutes(s.auto_off_min),
++            QuickRow::LowBattery => s.low_batt_alert = !s.low_batt_alert,
++            QuickRow::LowBatteryAt => s.low_batt_at = pct_step(s.low_batt_at, right),
+             QuickRow::Turbo => s.turbo = !s.turbo,
+             QuickRow::Rewind => s.rewind = !s.rewind,
+             QuickRow::GbPalettes => s.gb_palettes = !s.gb_palettes,
+@@ -2155,6 +3002,7 @@
+             | QuickRow::Settings
+             | QuickRow::ExitGame
+             | QuickRow::PlayScreen
++            | QuickRow::Shortcuts
+             | QuickRow::PlayGameplay
+             | QuickRow::Shader
+             | QuickRow::ColourCorrection
+@@ -2165,6 +3013,7 @@
+             | QuickRow::GbBezel
+             | QuickRow::GbcBezel
+             | QuickRow::GbaBezel
++            | QuickRow::Cheats
+             | QuickRow::Bezel => return,
+         }
+         self.persist();
+@@ -2402,8 +3251,19 @@
+             self.shelf_named = Some(self.now());
+         }
+         self.timers();
++        let now = self.now();
++        let idle_limit = self.state.auto_off_min as Millis * 60_000;
++        if idle_limit > 0
++            && matches!(self.phase, Phase::Shelf | Phase::Playing { .. })
++            && now.saturating_sub(self.last_activity) >= idle_limit
++        {
++            eprintln!(
++                "slot: idle: no input for {} min, powering off",
++                self.state.auto_off_min
++            );
++            self.poweroff();
++        }
+         self.poll_link();
+-        let now = self.now();
+         let ready = self.core_faces_ready();
+         if let Some(picker) = &mut self.core_picker {
+             if picker.waiting() && (ready || picker.waited(now) >= FACES_WAIT_MS) {
+@@ -2861,6 +3721,78 @@
+     }
+ 
+     pub fn draw(&self, out: &mut Vec<Draw>) {
++        self.draw_scene(out);
++        self.hud.draw(self.canvas(), self.now(), out);
++        self.draw_low_battery(out);
++        self.draw_wifi_badge(out);
++    }
++
++    fn draw_scene(&self, out: &mut Vec<Draw>) {
++        if let Some(page) = &self.wifi {
++            if let Some(tex) = page.tex {
++                out.push(Draw::Tex {
++                    x: 0.0,
++                    y: 0.0,
++                    w: OUT_W as f32,
++                    h: OUT_H as f32,
++                    tex,
++                    alpha: 1.0,
++                });
++            }
++            return;
++        }
++        if let Some(page) = &self.online_page {
++            if let Some(tex) = page.tex {
++                out.push(Draw::Tex {
++                    x: 0.0,
++                    y: 0.0,
++                    w: OUT_W as f32,
++                    h: OUT_H as f32,
++                    tex,
++                    alpha: 1.0,
++                });
++                return;
++            }
++        }
++        if let Some(panel) = &self.cheats {
++            if let Some(tex) = panel.tex {
++                out.push(Draw::Tex {
++                    x: 0.0,
++                    y: 0.0,
++                    w: OUT_W as f32,
++                    h: OUT_H as f32,
++                    tex,
++                    alpha: 1.0,
++                });
++            }
++            return;
++        }
++        if let Some(page) = &self.shortcuts {
++            if let Some(tex) = page.tex {
++                out.push(Draw::Tex {
++                    x: 0.0,
++                    y: 0.0,
++                    w: OUT_W as f32,
++                    h: OUT_H as f32,
++                    tex,
++                    alpha: 1.0,
++                });
++            }
++            return;
++        }
++        if let Some(page) = &self.letter_page {
++            if let Some(tex) = page.tex {
++                out.push(Draw::Tex {
++                    x: 0.0,
++                    y: 0.0,
++                    w: OUT_W as f32,
++                    h: OUT_H as f32,
++                    tex,
++                    alpha: 1.0,
++                });
++            }
++            return;
++        }
+         if let Some(index) = self.power_menu {
+             self.draw_power_menu(index, out);
+             return;
+@@ -2910,6 +3842,7 @@
+                 row: *row,
+                 hidden: self.hidden_rows(),
+                 values: QuickRow::ALL.map(|r| self.quick_value(r)),
++                font_value: self.font_value_face,
+                 clock: self.quick_clock_faces,
+                 wallpaper: self.quick_wallpaper_faces,
+                 faces: self.quick_menu_faces.as_ref(),
+@@ -2968,6 +3901,19 @@
+             }
+             Phase::About => {
+                 slot_ui::draw_menu_ground(self.canvas(), self.menu_ground(), out);
++                if self.about_page == 1 {
++                    if let Some(tex) = self.about_face {
++                        out.push(Draw::Tex {
++                            x: 0.0,
++                            y: 0.0,
++                            w: OUT_W as f32,
++                            h: OUT_H as f32,
++                            tex,
++                            alpha: 1.0,
++                        });
++                    }
++                    return;
++                }
+                 draw_sticker(self.canvas(), self.sticker_face, out);
+                 return;
+             }
+@@ -3029,6 +3975,7 @@
+                 row,
+                 hidden: self.in_game_hidden(),
+                 values: QuickRow::ALL.map(|r| self.quick_value(r)),
++                font_value: self.font_value_face,
+                 clock: None,
+                 wallpaper: None,
+                 faces: self.quick_menu_faces.as_ref(),
+@@ -3059,7 +4006,115 @@
+         if let Some(menu) = self.game_menu {
+             self.draw_game_menu(menu, out);
+         }
+-        self.hud.draw(self.canvas(), self.now(), out);
++    }
++
++    /// Three-bar Wi-Fi indicator next to the shelf clock.
++    fn draw_wifi_badge(&self, out: &mut Vec<Draw>) {
++        if !matches!(self.phase, Phase::Shelf) {
++            return;
++        }
++        if self.wifi.is_some()
++            || self.cheats.is_some()
++            || self.shortcuts.is_some()
++            || self.letter_page.is_some()
++            || self.online_page.is_some()
++        {
++            return;
++        }
++        let clock = self.shelf_clock;
++        if clock.w == 0 {
++            return;
++        }
++        let connected = self
++            .wifi_status
++            .as_ref()
++            .map(|s| s.connected())
++            .unwrap_or(false);
++        let ink = if connected {
++            [0.42, 0.93, 0.55, 1.0]
++        } else {
++            [0.48, 0.48, 0.52, 0.85]
++        };
++        let base_x = slot_gfx::OUT_W as f32 - 16.0 - clock.w as f32 - 44.0;
++        // Sit on the same baseline as the clock: both are HINT_H tall in the footer.
++        let y = slot_ui::footer::FOOTER_Y + 32.0 - 24.0;
++        self.push_wifi_glyph(base_x, y, ink, out);
++    }
++
++    fn push_wifi_glyph(&self, x0: f32, y0: f32, ink: [f32; 4], out: &mut Vec<Draw>) {
++        const W: i32 = 28;
++        const H: i32 = 20;
++        let cx = 14.0f32;
++        let cy = 17.5f32;
++        for y in 0..H {
++            for x in 0..W {
++                let mut hits = 0;
++                for sy in 0..2 {
++                    for sx in 0..2 {
++                        let px = x as f32 + (sx as f32 + 0.5) / 2.0;
++                        let py = y as f32 + (sy as f32 + 0.5) / 2.0;
++                        let dx = px - cx;
++                        let dy = py - cy;
++                        if dy > 0.0 {
++                            continue;
++                        }
++                        let r = (dx * dx + dy * dy).sqrt();
++                        if r <= 2.5 {
++                            hits += 1;
++                            continue;
++                        }
++                        for radius in [5.6f32, 9.8, 14.0] {
++                            if (r - radius).abs() <= 1.5 && dx.abs() <= r * 0.82 {
++                                hits += 1;
++                                break;
++                            }
++                        }
++                    }
++                }
++                if hits < 2 {
++                    continue;
++                }
++                let mut colour = ink;
++                colour[3] = ink[3] * (hits as f32 / 4.0);
++                out.push(Draw::Rect {
++                    x: x0 + x as f32,
++                    y: y0 + y as f32,
++                    w: 1.0,
++                    h: 1.0,
++                    colour,
++                });
++            }
++        }
++    }
++
++    /// Blinks a small battery gauge in the top-right corner while playing, so a
++    /// nearly flat console is obvious without opening the menu.
++    fn draw_low_battery(&self, out: &mut Vec<Draw>) {
++        if !self.state.low_batt_alert || !matches!(self.phase, Phase::Playing { .. }) {
++            return;
++        }
++        let Some(battery) = self.battery else {
++            return;
++        };
++        let pct = battery.percent.min(100) as f32;
++        if pct > self.state.low_batt_at as f32 {
++            return;
++        }
++        if (self.now() / 500) % 2 == 1 {
++            return;
++        }
++        let w = self.canvas().w;
++        let (bw, bh) = (34.0, 15.0);
++        let x = w - bw - 22.0;
++        let y = 16.0;
++        let red = [1.0, 0.22, 0.22, 0.95];
++        let dim = [0.0, 0.0, 0.0, 0.55];
++        out.push(Draw::Rect { x: x - 2.0, y: y - 2.0, w: bw + 4.0, h: bh + 4.0, colour: dim });
++        out.push(Draw::Rect { x, y, w: bw, h: bh, colour: red });
++        out.push(Draw::Rect { x: x + 2.0, y: y + 2.0, w: bw - 4.0, h: bh - 4.0, colour: dim });
++        let fill = (bw - 4.0) * (pct / 100.0);
++        out.push(Draw::Rect { x: x + 2.0, y: y + 2.0, w: fill, h: bh - 4.0, colour: red });
++        out.push(Draw::Rect { x: x + bw, y: y + 4.0, w: 3.0, h: bh - 8.0, colour: red });
+     }
+ 
+     pub fn screen_shake(&self) -> f32 {
+@@ -4442,6 +5497,47 @@
+     level.saturating_add(step).min(max)
+ }
+ 
++fn auto_off_value(minutes: u16) -> QuickValue {
++    match minutes {
++        3 => QuickValue::Minutes3,
++        10 => QuickValue::Minutes10,
++        30 => QuickValue::Minutes30,
++        _ => QuickValue::Never,
++    }
++}
++
++fn pct_value(percent: u8) -> QuickValue {
++    match percent {
++        0..=7 => QuickValue::Pct5,
++        8..=12 => QuickValue::Pct10,
++        13..=17 => QuickValue::Pct15,
++        18..=22 => QuickValue::Pct20,
++        23..=27 => QuickValue::Pct25,
++        _ => QuickValue::Pct30,
++    }
++}
++
++fn auto_off_minutes(step: u16) -> u16 {
++    match step {
++        3 => 10,
++        10 => 30,
++        30 => 0,
++        _ => 3,
++    }
++}
++
++fn pct_step(percent: u8, right: bool) -> u8 {
++    let steps = [5u8, 10, 15, 20, 25, 30];
++    let at = steps
++        .iter()
++        .position(|&v| v >= percent)
++        .unwrap_or(steps.len() - 1);
++    if right {
++        steps[(at + 1) % steps.len()]
++    } else {
++        steps[(at + steps.len() - 1) % steps.len()]
++    }
++}
+ fn shader_value(shader: Shader) -> QuickValue {
+     match shader {
+         Shader::Off => QuickValue::Off,
+@@ -4555,3 +5651,150 @@
+         Platform::Gbc => 2,
+     }
+ }
++
++/// Fonts found on the card: the built-in pixel face plus every TTF/OTF dropped
++/// into ``System/Fonts``. Names are leaked once because the menu needs
++/// ``&'static str`` labels.
++pub fn scan_fonts(root: &std::path::Path) -> Vec<(&'static str, Option<std::path::PathBuf>)> {
++    let mut out: Vec<(&'static str, Option<std::path::PathBuf>)> =
++        vec![("\u{50cf}\u{7d20}\u{ff08}\u{5185}\u{7f6e}\u{ff09}", None)];
++    let Ok(dir) = std::fs::read_dir(root.join("System").join("Fonts")) else {
++        return out;
++    };
++    let mut files: Vec<std::path::PathBuf> = dir
++        .flatten()
++        .map(|entry| entry.path())
++        .filter(|path| {
++            matches!(
++                path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
++                Some("ttf") | Some("otf")
++            )
++        })
++        .collect();
++    files.sort();
++    for path in files {
++        let name = path
++            .file_stem()
++            .and_then(|stem| stem.to_str())
++            .unwrap_or("\u{5b57}\u{4f53}");
++        out.push((Box::leak(name.to_string().into_boxed_str()), Some(path)));
++    }
++    out
++}
++
++impl App {
++    /// Restores the font name saved in ``Config/font.txt``.
++    pub fn pick_saved_font(&mut self, root: &std::path::Path) {
++        let Ok(saved) = std::fs::read_to_string(root.join("Config").join("font.txt")) else {
++            return;
++        };
++        let saved = saved.trim().trim_start_matches('\u{feff}').trim();
++        if let Some(index) = self.fonts.iter().position(|(name, _)| *name == saved) {
++            self.font_pick = index;
++        }
++    }
++
++    /// Loads the current pick into the text layer. Falls back to the embedded
++    /// pixel face when the file cannot be read.
++    pub fn apply_font(&mut self) {
++        let Some((_, path)) = self.fonts.get(self.font_pick) else {
++            return;
++        };
++        match path {
++            None => slot_ui::text::use_builtin_font(),
++            Some(path) => match std::fs::read(path) {
++                Ok(bytes) => {
++                    if !slot_ui::text::set_font(bytes) {
++                        eprintln!("slot: font: {} is not a usable TTF/OTF", path.display());
++                        slot_ui::text::use_builtin_font();
++                    } else {
++                        eprintln!("slot: font: {}", path.display());
++                    }
++                }
++                Err(err) => {
++                    eprintln!("slot: font: {}: {err}", path.display());
++                    slot_ui::text::use_builtin_font();
++                }
++            },
++        }
++    }
++
++    fn font_key(&self) -> String {
++        match self.fonts.get(self.font_pick) {
++            Some((_, None)) | None => "pixel".to_string(),
++            Some((_, Some(path))) => std::path::Path::new(path)
++                .file_stem()
++                .map(|s| s.to_string_lossy().to_lowercase())
++                .unwrap_or_else(|| "pixel".to_string()),
++        }
++    }
++
++    fn cycle_font(&mut self, right: bool) {
++        if self.fonts.len() < 2 {
++            return;
++        }
++        let len = self.fonts.len();
++        self.font_pick = if right {
++            (self.font_pick + 1) % len
++        } else {
++            (self.font_pick + len - 1) % len
++        };
++        self.hud.toast(Toast::FontSaved, self.now());
++        if let Some(root) = self.root.clone() {
++            let dir = root.join("Config");
++            let _ = std::fs::create_dir_all(&dir);
++            let _ = std::fs::write(dir.join("font.txt"), self.font_key());
++        }
++        eprintln!("slot: font pick: {}", self.font_label());
++    }
++
++    /// True while the modified About page still needs its overlay texture.
++    pub fn about_wants_page(&self) -> bool {
++        self.about_page == 1 && self.about_face.is_none()
++    }
++
++    pub fn set_about_face(&mut self, tex: TexId) {
++        self.about_face = Some(tex);
++    }
++
++    /// Name shown next to the 字体 row.
++    pub fn font_label(&self) -> &'static str {
++        let raw = self.raw_font_label();
++        match raw.to_lowercase().as_str() {
++            "simhei" => "黑体",
++            "simkai" => "楷体",
++            "simsun" => "宋体",
++            "fangsong" => "仿宋",
++            "msyh" | "msyhbd" => "微软雅黑",
++            "deng" | "dengxian" => "等线",
++            "consolas" | "consola" => "Consolas",
++            "arial" => "Arial",
++            _ => raw,
++        }
++    }
++
++    fn raw_font_label(&self) -> &'static str {
++        self.fonts
++            .get(self.font_pick)
++            .map(|(name, _)| *name)
++            .unwrap_or("\u{50cf}\u{7d20}")
++    }
++
++    pub fn font_value_face(&self) -> Option<(TexId, u32, u32)> {
++        self.font_value_face
++    }
++
++    pub fn set_font_value_face(&mut self, face: Option<(TexId, u32, u32)>) {
++        self.font_value_face = face;
++    }
++}
++
++/// Sort key for the letter sheet: digits, latin letters, hanzi, everything else.
++fn rank(label: &str) -> u8 {
++    match label.chars().next() {
++        Some(c) if c.is_ascii_digit() => 0,
++        Some(c) if c.is_ascii_alphabetic() => 1,
++        Some(c) if !c.is_ascii() => 2,
++        _ => 3,
++    }
++}
+--- a/crates\slot\src\frontend.rs
++++ b/crates\slot\src\frontend.rs
+@@ -1,4 +1,4 @@
+-use std::time::{Duration, Instant};
++﻿use std::time::{Duration, Instant};
+ 
+ use slot_gfx::{Compositor, Draw, ScreenEffect, TexId, OUT_H, OUT_W};
+ 
+@@ -57,11 +57,13 @@
+     quick_clock: QuickClock,
+     quick_palette: QuickPalette,
+     wallpaper: WallpaperSync,
++    cart_bg: CartBgSync,
+     game_bezel: BezelSync,
+     look: Option<ShelfLook>,
+     link_shot: Option<TexId>,
+     link_shot_size: (u32, u32),
+     link_shot_shown: bool,
++    font_value: FontValueSync,
+ }
+ 
+ #[derive(Default)]
+@@ -101,6 +103,578 @@
+     label: String,
+     dim: Option<TexId>,
+     lit: Option<TexId>,
++}
++
++/// The blurred label art used as the shelf backdrop for the selected cart.
++#[derive(Default)]
++struct CartBgSync {
++    key: Option<String>,
++    /// Two textures, alternating, so the outgoing backdrop can fade out while
++    /// the incoming one fades in.
++    slots: [Option<TexId>; 2],
++    cur: usize,
++    /// Blurred backdrops already painted, so revisiting a cart is instant.
++    cache: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
++    /// The cart whose backdrop is being painted off-thread right now.
++    pending: Option<std::path::PathBuf>,
++}
++
++enum BackdropJob {
++    /// Blur a label image from `Labels/<platform>/`.
++    Label(std::path::PathBuf),
++    /// No cover art for this game: derive a backdrop from the cartridge face
++    /// itself, so every cartridge still gets its own background.
++    Face(Box<slot_store::Cart>),
++}
++
++type BackdropJobs = std::sync::mpsc::Sender<(std::path::PathBuf, BackdropJob)>;
++type BackdropDone = std::sync::mpsc::Receiver<(std::path::PathBuf, Vec<u8>)>;
++
++/// Painting a backdrop means decoding a PNG, resizing it and blurring it, which
++/// is long enough to drop a frame. Keep one worker thread doing that work and
++/// only touch the GPU when the bytes come back.
++fn backdrop_worker() -> std::sync::MutexGuard<'static, (BackdropJobs, BackdropDone)> {
++    static W: std::sync::OnceLock<std::sync::Mutex<(BackdropJobs, BackdropDone)>> =
++        std::sync::OnceLock::new();
++    W.get_or_init(|| {
++        let (job_tx, job_rx) = std::sync::mpsc::channel::<(std::path::PathBuf, BackdropJob)>();
++        let (res_tx, res_rx) = std::sync::mpsc::channel::<(std::path::PathBuf, Vec<u8>)>();
++        std::thread::Builder::new()
++            .name("slot-backdrop".into())
++            .spawn(move || {
++                while let Ok(mut job) = job_rx.recv() {
++                    // Only the newest selection matters.
++                    while let Ok(newer) = job_rx.try_recv() {
++                        job = newer;
++                    }
++                    let (key, source) = job;
++                    let face = match &source {
++                        BackdropJob::Label(path) => wallpaper_face(path),
++                        BackdropJob::Face(cart) => Some(face_backdrop(cart)),
++                    };
++                    if let Some(face) = face {
++                        let mut rgba = blur_face(&face);
++                        if matches!(source, BackdropJob::Face(_)) {
++                            // A blurred cartridge is much flatter than printed
++                            // key art; push the colour so each cartridge still
++                            // reads as a different background.
++                            boost(&mut rgba);
++                        }
++                        if res_tx.send((key, rgba)).is_err() {
++                            return;
++                        }
++                    }
++                }
++            })
++            .ok();
++        std::sync::Mutex::new((job_tx, res_rx))
++    })
++    .lock()
++    .unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
++/// Renders the cartridge face and cover-crops it into an OUT_W×OUT_H field.
++/// Used when a game has no cover art anywhere, so the shelf background still
++/// changes per cartridge instead of falling back to the plain wallpaper.
++fn face_backdrop(cart: &slot_store::Cart) -> Vec<u8> {
++    let mut out = vec![0u8; OUT_W as usize * OUT_H as usize * 4];
++    for px in out.chunks_exact_mut(4) {
++        px.copy_from_slice(&[0x18, 0x16, 0x14, 0xff]);
++    }
++    let face = slot_ui::cart_face(cart);
++    if face.w == 0 || face.h == 0 {
++        return out;
++    }
++    let (fw, fh) = (face.w as f32, face.h as f32);
++    let target = OUT_W as f32 / OUT_H as f32;
++    let (crop_w, crop_h) = if fw / fh > target {
++        (fh * target, fh)
++    } else {
++        (fw, fw / target)
++    };
++    let off_x = (fw - crop_w) * 0.5;
++    let off_y = (fh - crop_h) * 0.5;
++    for y in 0..OUT_H {
++        for x in 0..OUT_W {
++            let u = off_x + (x as f32 + 0.5) / OUT_W as f32 * crop_w;
++            let v = off_y + (y as f32 + 0.5) / OUT_H as f32 * crop_h;
++            let sx = (u as u32).min(face.w - 1);
++            let sy = (v as u32).min(face.h - 1);
++            let src = ((sy * face.w + sx) * 4) as usize;
++            let dst = ((y * OUT_W + x) * 4) as usize;
++            let a = face.rgba[src + 3] as f32 / 255.0;
++            for c in 0..3 {
++                let over = face.rgba[src + c] as f32 * a + out[dst + c] as f32 * (1.0 - a);
++                out[dst + c] = over.clamp(0.0, 255.0) as u8;
++            }
++        }
++    }
++    out
++}
++
++/// Pushes saturation and contrast of a backdrop so a blurred cartridge face
++/// still reads as a distinct background.
++fn boost(rgba: &mut [u8]) {
++    for px in rgba.chunks_exact_mut(4) {
++        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
++        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
++        for (i, value) in [r, g, b].into_iter().enumerate() {
++            let boosted = luma + (value - luma) * 1.7;
++            let contrasted = (boosted - 128.0) * 1.12 + 128.0;
++            px[i] = contrasted.clamp(0.0, 255.0) as u8;
++        }
++    }
++}
++
++fn paint_backdrop(
++    app: &mut App,
++    compositor: &mut Compositor,
++    state: &mut CartBgSync,
++    rgba: &[u8],
++) {
++    if rgba.len() < OUT_W as usize * OUT_H as usize * 4 {
++        return;
++    }
++    let idx = 1 - state.cur;
++    let tex = match state.slots[idx] {
++        Some(id) => {
++            compositor.update_texture(id, OUT_W, OUT_H, rgba);
++            id
++        }
++        None => {
++            let id = compositor.create_texture(OUT_W, OUT_H, rgba);
++            state.slots[idx] = Some(id);
++            id
++        }
++    };
++    let prev = state.slots[state.cur];
++    state.cur = idx;
++    app.set_cart_backdrop(Some(tex), prev, Some(CART_BG_FADE_MS));
++}
++
++fn sync_cart_backdrop(app: &mut App, compositor: &mut Compositor, state: &mut CartBgSync) {
++    let (key, source): (Option<String>, Option<BackdropJob>) = match app.phase() {
++        Phase::Shelf => match app.selected_cart() {
++            Some(cart) => {
++                let source = match label_for(cart) {
++                    Some(path) => BackdropJob::Label(path),
++                    None => BackdropJob::Face(Box::new(cart.clone())),
++                };
++                (Some(cart.rom.to_string_lossy().into_owned()), Some(source))
++            }
++            None => (None, None),
++        },
++        _ => (None, None),
++    };
++    if state.key != key {
++        state.key = key;
++        state.pending = None;
++        match source {
++            Some(source) => {
++                let cache_key = match &source {
++                    BackdropJob::Label(path) => path.clone(),
++                    BackdropJob::Face(cart) => cart.rom.clone(),
++                };
++                if let Some(hit) = state.cache.get(&cache_key) {
++                    let rgba = hit.clone();
++                    paint_backdrop(app, compositor, state, &rgba);
++                } else if backdrop_worker()
++                    .0
++                    .send((cache_key.clone(), source))
++                    .is_ok()
++                {
++                    state.pending = Some(cache_key);
++                }
++            }
++            None => {
++                let prev = state.slots[state.cur];
++                app.set_cart_backdrop(None, prev, Some(CART_BG_FADE_MS));
++            }
++        }
++    }
++    // Collect anything the worker finished since the last frame.
++    let worker = backdrop_worker();
++    let mut done = Vec::new();
++    while let Ok(item) = worker.1.try_recv() {
++        done.push(item);
++    }
++    drop(worker);
++    for (path, rgba) in done {
++        if state.cache.len() >= 12 {
++            state.cache.clear();
++        }
++        state.cache.insert(path.clone(), rgba.clone());
++        if state.pending.as_deref() == Some(path.as_path()) {
++            state.pending = None;
++            paint_backdrop(app, compositor, state, &rgba);
++        }
++    }
++}
++
++const CART_BG_FADE_MS: u64 = 220;
++
++/// The label art for a cart. Labels follow the card's own naming, which often
++/// differs from the ROM file name (`(patched)`, tags, romanisation), so an exact
++/// hit is tried first and then a normalised substring match picks the closest.
++fn label_for(cart: &slot_store::Cart) -> Option<std::path::PathBuf> {
++    if let Some(label) = &cart.label {
++        return Some(label.clone());
++    }
++    let root = cart.rom.parent()?.parent()?.parent()?;
++    let labels = root.join("Labels").join(cart.platform.dir_name());
++    let want = core_key(&cart.stem);
++    if want.is_empty() {
++        return None;
++    }
++    let want_chars: std::collections::HashSet<char> = want.chars().collect();
++    let mut best: Option<(f32, usize, std::path::PathBuf)> = None;
++    for entry in std::fs::read_dir(&labels).ok()?.flatten() {
++        let name = entry.file_name().to_string_lossy().into_owned();
++        let stem = match name.to_lowercase().strip_suffix(".png") {
++            Some(stem) => stem.to_string(),
++            None => continue,
++        };
++        // Cover sets are named after the original ROM stem, so once the noise
++        // (bracket tags, `(patched)`, version strings) is stripped an exact
++        // match is the strongest signal and needs no fuzzy scoring.
++        let candidate = core_key(&stem);
++        if candidate.is_empty() {
++            continue;
++        }
++        if candidate == want {
++            return Some(entry.path());
++        }
++        let chars: std::collections::HashSet<char> = candidate.chars().collect();
++        let hit = chars.iter().filter(|c| want_chars.contains(c)).count();
++        let ratio = hit as f32 / chars.len() as f32;
++        if hit < 2 || ratio < 0.6 {
++            continue;
++        }
++        let better = match &best {
++            None => true,
++            Some((top, len, _)) => {
++                ratio > *top + 0.001 || ((ratio - *top).abs() < 0.001 && chars.len() > *len)
++            }
++        };
++        if better {
++            best = Some((ratio, chars.len(), entry.path()));
++        }
++    }
++    best.map(|(_, _, path)| path)
++}
++
++fn normalise(text: &str) -> String {
++    text.chars()
++        .filter(|c| c.is_alphanumeric())
++        .flat_map(char::to_lowercase)
++        .collect()
++}
++
++/// Matching key for a ROM/label name: bracket groups (`(US)`, `（中文版）`,
++/// `[...]`), version strings and patch markers are dropped, everything else is
++/// lowercased and reduced to alphanumerics. Cover sets in the wild are named
++/// after the original ROM stem, so stripping the same noise from both sides
++/// turns most lookups into an exact match.
++fn core_key(text: &str) -> String {
++    let mut out = String::new();
++    let mut depth = 0i32;
++    for c in text.chars() {
++        match c {
++            '(' | '[' | '（' | '【' => depth += 1,
++            ')' | ']' | '）' | '】' => depth = (depth - 1).max(0),
++            _ if depth == 0 => out.push(c),
++            _ => {}
++        }
++    }
++    let mut cleaned = out.to_lowercase();
++    for tag in [
++        "(patched)",
++        "patched",
++        "ver1.00",
++        "ver 1.0",
++        "中文版",
++        "汉化版",
++        "简中",
++        "汉化",
++        "-cn",
++        "_cn",
++    ] {
++        cleaned = cleaned.replace(tag, " ");
++    }
++    cleaned.chars().filter(|c| c.is_alphanumeric()).collect()
++}
++
++fn sync_cheat_panel(app: &mut App, compositor: &mut Compositor) {
++    let Some(panel) = app.cheat_panel() else {
++        return;
++    };
++    if !panel.dirty {
++        return;
++    }
++    let rgba = crate::cheat_panel::render(panel);
++    let tex = match panel.tex {
++        Some(id) => {
++            compositor.update_texture(id, OUT_W, OUT_H, &rgba);
++            id
++        }
++        None => compositor.create_texture(OUT_W, OUT_H, &rgba),
++    };
++    app.set_cheat_face(tex);
++}
++
++fn sync_online_page(app: &mut App, compositor: &mut Compositor) {
++    app.tick_online_page();
++    let Some(page) = app.online_page_ref() else {
++        return;
++    };
++    if !page.dirty {
++        return;
++    }
++    let rgba = page.render();
++    let tex = match page.tex {
++        Some(id) => {
++            compositor.update_texture(id, OUT_W, OUT_H, &rgba);
++            id
++        }
++        None => compositor.create_texture(OUT_W, OUT_H, &rgba),
++    };
++    app.set_online_face(tex);
++}
++
++fn sync_wifi(app: &mut App, compositor: &mut Compositor) {
++    let Some(page) = app.wifi_page() else {
++        return;
++    };
++    if !page.dirty {
++        return;
++    }
++    let rgba = crate::wifi_page::render(page);
++    let tex = match page.tex {
++        Some(id) => {
++            compositor.update_texture(id, OUT_W, OUT_H, &rgba);
++            id
++        }
++        None => compositor.create_texture(OUT_W, OUT_H, &rgba),
++    };
++    app.set_wifi_face(tex);
++}
++fn sync_letter_page(app: &mut App, compositor: &mut Compositor) {
++    let Some(page) = app.letter_page() else {
++        return;
++    };
++    if page.tex.is_some() && !page.dirty {
++        return;
++    }
++    let had = page.tex.is_some();
++    let rgba = crate::letter_page::render(page);
++    let tex = if had {
++        match page.tex {
++            Some(tex) => {
++                compositor.update_texture(tex, OUT_W, OUT_H, &rgba);
++                tex
++            }
++            None => compositor.create_texture(OUT_W, OUT_H, &rgba),
++        }
++    } else {
++        compositor.create_texture(OUT_W, OUT_H, &rgba)
++    };
++    app.set_letter_face(tex);
++    app.letter_page_clean();
++}
++
++fn sync_shortcuts(app: &mut App, compositor: &mut Compositor) {
++    let Some(page) = app.shortcut_page() else {
++        return;
++    };
++    if page.tex.is_some() {
++        return;
++    }
++    let rgba = crate::shortcuts::render();
++    let tex = compositor.create_texture(OUT_W, OUT_H, &rgba);
++    app.set_shortcut_face(tex);
++}
++
++/// Three passes of a separable box blur: soft enough to read as an out-of-focus
++/// backdrop, cheap enough to rebuild on every cartridge change.
++struct FontValueSync {
++    tex: Option<(TexId, u32, u32)>,
++    key: String,
++}
++
++impl Default for FontValueSync {
++    fn default() -> Self {
++        Self {
++            tex: None,
++            key: String::new(),
++        }
++    }
++}
++
++fn sync_font_value(app: &mut App, compositor: &mut Compositor, state: &mut FontValueSync) {
++    let name = app.font_label();
++    if state.key == name {
++        app.set_font_value_face(state.tex);
++        return;
++    }
++    let face = slot_ui::quick_value_face(name, true);
++    if face.w == 0 || face.h == 0 {
++        return;
++    }
++    let tex = compositor.create_texture(face.w, face.h, &face.rgba);
++    let entry = (tex, face.w, face.h);
++    state.tex = Some(entry);
++    state.key = name.to_string();
++    app.set_font_value_face(Some(entry));
++}
++
++fn sync_wifi_icon(app: &mut App, compositor: &mut Compositor) {
++    if app.wifi_icons().0.is_some() {
++        return;
++    }
++    let (on, ow, oh) = slot_ui::wifi_face([110, 235, 150]);
++    let (off, gw, gh) = slot_ui::wifi_face([150, 150, 160]);
++    let tex_on = compositor.create_texture(ow, oh, &on);
++    let tex_off = compositor.create_texture(gw, gh, &off);
++    app.set_wifi_icons(tex_on, tex_off);
++}
++
++fn sync_about_page(app: &mut App, compositor: &mut Compositor) {
++    if !app.about_wants_page() {
++        return;
++    }
++    let rgba = crate::about_page::render();
++    let tex = compositor.create_texture(OUT_W, OUT_H, &rgba);
++    app.set_about_face(tex);
++}
++
++fn blur_face(rgba: &[u8]) -> Vec<u8> {
++    let (w, h) = (OUT_W as usize, OUT_H as usize);
++    let buf: Vec<[u8; 4]> = rgba
++        .chunks_exact(4)
++        .take(w * h)
++        .map(|c| [c[0], c[1], c[2], c[3]])
++        .collect();
++    if buf.len() < w * h {
++        return rgba.to_vec();
++    }
++    // Blur a half-resolution copy and scale back up: the result is a blurred
++    // backdrop either way, and this is four times less work per switch.
++    let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
++    let mut small = vec![[0u8, 0, 0, 0]; hw * hh];
++    for y in 0..hh {
++        for x in 0..hw {
++            let (mut acc, mut n) = ([0u32; 3], 0u32);
++            for dy in 0..2 {
++                for dx in 0..2 {
++                    let sx = (x * 2 + dx).min(w - 1);
++                    let sy = (y * 2 + dy).min(h - 1);
++                    let px = &buf[sy * w + sx];
++                    acc[0] += px[0] as u32;
++                    acc[1] += px[1] as u32;
++                    acc[2] += px[2] as u32;
++                    n += 1;
++                }
++            }
++            let n = n.max(1);
++            small[y * hw + x] = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8, 255];
++        }
++    }
++    let mut tmp = vec![[0u8, 0, 0, 0]; hw * hh];
++    let radius = (hh / 12).max(3) as isize;
++    for _ in 0..3 {
++        blur_rows(&small, &mut tmp, hw, hh, radius);
++        blur_cols(&tmp, &mut small, hw, hh, radius);
++    }
++    let mut out = Vec::with_capacity(w * h * 4);
++    for y in 0..h {
++        let sy = y * hh / h;
++        for x in 0..w {
++            let sx = x * hw / w;
++            let px = small[sy * hw + sx];
++            out.extend_from_slice(&px);
++        }
++    }
++    out
++}
++
++fn blur_rows(src: &[[u8; 4]], dst: &mut [[u8; 4]], w: usize, h: usize, r: isize) {
++    let r = r.max(0) as usize;
++    for y in 0..h {
++        let row = &src[y * w..(y + 1) * w];
++        let mut acc = [0u32; 3];
++        let mut n = 0usize;
++        for px in row.iter().take((r + 1).min(w)) {
++            acc[0] += px[0] as u32;
++            acc[1] += px[1] as u32;
++            acc[2] += px[2] as u32;
++            n += 1;
++        }
++        for x in 0..w {
++            if x > 0 {
++                if x > r {
++                    let px = row[x - 1 - r];
++                    acc[0] -= px[0] as u32;
++                    acc[1] -= px[1] as u32;
++                    acc[2] -= px[2] as u32;
++                    n -= 1;
++                }
++                let add = x + r;
++                if add < w {
++                    let px = row[add];
++                    acc[0] += px[0] as u32;
++                    acc[1] += px[1] as u32;
++                    acc[2] += px[2] as u32;
++                    n += 1;
++                }
++            }
++            let out = &mut dst[y * w + x];
++            let n = n.max(1) as u32;
++            out[0] = (acc[0] / n) as u8;
++            out[1] = (acc[1] / n) as u8;
++            out[2] = (acc[2] / n) as u8;
++            out[3] = 255;
++        }
++    }
++}
++
++fn blur_cols(src: &[[u8; 4]], dst: &mut [[u8; 4]], w: usize, h: usize, r: isize) {
++    let r = r.max(0) as usize;
++    for x in 0..w {
++        let mut acc = [0u32; 3];
++        let mut n = 0usize;
++        for y in 0..(r + 1).min(h) {
++            let px = &src[y * w + x];
++            acc[0] += px[0] as u32;
++            acc[1] += px[1] as u32;
++            acc[2] += px[2] as u32;
++            n += 1;
++        }
++        for y in 0..h {
++            if y > 0 {
++                if y > r {
++                    let px = &src[(y - 1 - r) * w + x];
++                    acc[0] -= px[0] as u32;
++                    acc[1] -= px[1] as u32;
++                    acc[2] -= px[2] as u32;
++                    n -= 1;
++                }
++                let add = y + r;
++                if add < h {
++                    let px = &src[add * w + x];
++                    acc[0] += px[0] as u32;
++                    acc[1] += px[1] as u32;
++                    acc[2] += px[2] as u32;
++                    n += 1;
++                }
++            }
++            let out = &mut dst[y * w + x];
++            let n = n.max(1) as u32;
++            out[0] = (acc[0] / n) as u8;
++            out[1] = (acc[1] / n) as u8;
++            out[2] = (acc[2] / n) as u8;
++            out[3] = 255;
++        }
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -179,11 +753,13 @@
+             quick_clock: QuickClock::default(),
+             quick_palette: QuickPalette::default(),
+             wallpaper: WallpaperSync::default(),
++            cart_bg: CartBgSync::default(),
+             game_bezel: BezelSync::default(),
+             look: None,
+             link_shot: None,
+             link_shot_size: (0, 0),
+             link_shot_shown: false,
++            font_value: FontValueSync::default(),
+         }
+     }
+ 
+@@ -520,6 +1096,18 @@
+         sync_quick_clock(self.session.app_mut(), compositor, &mut self.quick_clock);
+         sync_quick_palette(self.session.app_mut(), compositor, &mut self.quick_palette);
+         sync_wallpaper(self.session.app_mut(), compositor, &mut self.wallpaper);
++        sync_cart_backdrop(self.session.app_mut(), compositor, &mut self.cart_bg);
++        sync_cheat_panel(self.session.app_mut(), compositor);
++        sync_online_page(self.session.app_mut(), compositor);
++        self.session.app_mut().poll_online_cheats();
++        self.session.app_mut().poll_wifi();
++        self.session.app_mut().poll_wifi_scan();
++        self.session.app_mut().poll_online_art();
++        sync_wifi(self.session.app_mut(), compositor);
++    sync_shortcuts(self.session.app_mut(), compositor);
++    sync_about_page(self.session.app_mut(), compositor);
++        sync_letter_page(self.session.app_mut(), compositor);
++    sync_font_value(self.session.app_mut(), compositor, &mut self.font_value);
+         sync_game_bezel(self.session.app_mut(), compositor, &mut self.game_bezel);
+         compositor.set_game_bezel(self.session.app().shown_game_bezel());
+         compositor.set_sp_frame(self.session.app().sp_frame());
+--- a/crates\slot\src\input\host.rs
++++ b/crates\slot\src\input\host.rs
+@@ -1,25 +1,53 @@
+-use gilrs::{EventType, Gilrs};
++use gilrs::{Axis, Button, EventType, Gilrs};
+ use slot_input::{Btn, InputSource, Millis, RawEvent};
+ use winit::event::WindowEvent;
+ use winit::keyboard::{KeyCode, PhysicalKey};
+ 
+ use super::keys::key_to_btn;
+ use super::pad::pad_to_btn;
++
++/// The left stick has to travel past `STICK_PRESS` to count as a d-pad
++/// direction, and come back under `STICK_RELEASE` to let go, so a stick resting
++/// near the edge does not rattle between up/down every frame.
++const STICK_PRESS: f32 = 0.55;
++const STICK_RELEASE: f32 = 0.35;
++
++#[derive(Default)]
++struct Stick {
++    up: bool,
++    down: bool,
++    left: bool,
++    right: bool,
++}
+ 
+ pub struct HostInput {
+     pending: Vec<RawEvent>,
+     pad: Option<Gilrs>,
+     lid_closed: bool,
+     held_keys: Vec<Btn>,
++    stick: Stick,
++    unknown_button_logged: bool,
+ }
+ 
+ impl HostInput {
+     pub fn new() -> Self {
++        let pad = match Gilrs::new() {
++            Ok(gilrs) => Some(gilrs),
++            Err(e) => {
++                eprintln!("slot: pad: gilrs init failed: {e}");
++                None
++            }
++        };
++        if let Some(gilrs) = pad.as_ref() {
++            describe_pads(gilrs);
++        }
+         HostInput {
+             pending: Vec::new(),
+-            pad: Gilrs::new().ok(),
++            pad,
+             lid_closed: false,
+             held_keys: Vec::new(),
++            stick: Stick::default(),
++            unknown_button_logged: false,
+         }
+     }
+ 
+@@ -30,6 +58,15 @@
+                 let PhysicalKey::Code(code) = event.physical_key else {
+                     return;
+                 };
++                if std::env::var_os("SLOT_KEY_DEBUG").is_some() {
++                    eprintln!(
++                        "slot: key: {code:?} physical={:?} virtual={:?} {} -> {:?}",
++                        event.physical_key,
++                        event.logical_key,
++                        if event.state.is_pressed() { "press" } else { "release" },
++                        key_to_btn(code)
++                    );
++                }
+                 self.key(code, event.state.is_pressed(), event.repeat);
+             }
+             _ => {}
+@@ -40,6 +77,7 @@
+         for btn in std::mem::take(&mut self.held_keys) {
+             self.pending.push(RawEvent::Up(btn));
+         }
++        self.stick = Stick::default();
+     }
+ 
+     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
+@@ -80,7 +118,9 @@
+     }
+ 
+     fn drain_pad(&mut self) {
+-        let Some(pad) = self.pad.as_mut() else {
++        // Take the context out so this function can still touch `self` (the
++        // stick state and the pending queue) while it is polling events.
++        let Some(mut pad) = self.pad.take() else {
+             return;
+         };
+         let mut edges = Vec::new();
+@@ -88,14 +128,86 @@
+             match ev.event {
+                 EventType::ButtonPressed(b, _) => edges.push((b, true)),
+                 EventType::ButtonReleased(b, _) => edges.push((b, false)),
++                EventType::Connected => {
++                    if let Some(g) = pad.connected_gamepad(ev.id) {
++                        eprintln!("slot: pad: connected {}", describe(&g));
++                    }
++                }
++                EventType::Disconnected => {
++                    eprintln!("slot: pad: disconnected #{}", ev.id);
++                }
++                EventType::AxisChanged(axis, value, _) => {
++                    if let Some((btn, pressed)) = self.stick_edge(axis, value) {
++                        self.push(btn, pressed);
++                    }
++                }
+                 _ => {}
+             }
+         }
++        self.pad = Some(pad);
++        let pad_debug = std::env::var_os("SLOT_PAD_DEBUG").is_some();
+         for (b, pressed) in edges {
++            if pad_debug {
++                eprintln!(
++                    "slot: pad: {b:?} {} -> {:?}",
++                    if pressed { "press" } else { "release" },
++                    pad_to_btn(b)
++                );
++            }
++            if b == Button::Unknown {
++                if !self.unknown_button_logged {
++                    self.unknown_button_logged = true;
++                    eprintln!(
++                        "slot: pad: a button arrived unmapped - this pad has no SDL mapping, \
++                         so only the d-pad and sticks will work"
++                    );
++                }
++                continue;
++            }
+             if let Some(btn) = pad_to_btn(b) {
+                 self.push(btn, pressed);
+             }
+         }
++    }
++
++    /// Turns left-stick motion into synthetic d-pad presses with hysteresis.
++    fn stick_edge(&mut self, axis: Axis, value: f32) -> Option<(Btn, bool)> {
++        let (pressed, btn) = match axis {
++            Axis::LeftStickY => {
++                if value < -STICK_PRESS {
++                    (true, Btn::Up)
++                } else if value > STICK_PRESS {
++                    (true, Btn::Down)
++                } else if value.abs() < STICK_RELEASE && (self.stick.up || self.stick.down) {
++                    (false, if self.stick.up { Btn::Up } else { Btn::Down })
++                } else {
++                    return None;
++                }
++            }
++            Axis::LeftStickX => {
++                if value < -STICK_PRESS {
++                    (true, Btn::Left)
++                } else if value > STICK_PRESS {
++                    (true, Btn::Right)
++                } else if value.abs() < STICK_RELEASE && (self.stick.left || self.stick.right) {
++                    (false, if self.stick.left { Btn::Left } else { Btn::Right })
++                } else {
++                    return None;
++                }
++            }
++            _ => return None,
++        };
++        let slot = match btn {
++            Btn::Up => &mut self.stick.up,
++            Btn::Down => &mut self.stick.down,
++            Btn::Left => &mut self.stick.left,
++            _ => &mut self.stick.right,
++        };
++        if *slot == pressed {
++            return None;
++        }
++        *slot = pressed;
++        Some((btn, pressed))
+     }
+ }
+ 
+@@ -111,3 +223,40 @@
+         std::mem::take(&mut self.pending)
+     }
+ }
++
++fn describe_pads(gilrs: &Gilrs) {
++    let mut any = false;
++    for (id, gamepad) in gilrs.gamepads() {
++        any = true;
++        eprintln!(
++            "slot: pad: {} [#{}] {}",
++            describe(&gamepad),
++            id,
++            pad_status(&gamepad)
++        );
++    }
++    if !any {
++        eprintln!("slot: pad: none detected yet (plug one in; hot-plug is picked up)");
++    }
++}
++
++fn describe(gamepad: &gilrs::Gamepad<'_>) -> String {
++    format!(
++        "{} (vendor {:04x} product {:04x})",
++        gamepad.name(),
++        gamepad.vendor_id().unwrap_or(0),
++        gamepad.product_id().unwrap_or(0),
++    )
++}
++
++fn pad_status(gamepad: &gilrs::Gamepad<'_>) -> String {
++    use gilrs::MappingSource;
++    match gamepad.mapping_source() {
++        MappingSource::SdlMappings => "mapped by the SDL database".to_string(),
++        MappingSource::Driver => "mapping provided by the driver".to_string(),
++        MappingSource::None => format!(
++            "NO MAPPING (os name {:?}) - d-pad and sticks only",
++            gamepad.os_name()
++        ),
++    }
++}
+--- a/crates\slot\src\input\mod.rs
++++ b/crates\slot\src\input\mod.rs
+@@ -12,4 +12,6 @@
+ pub use device::DeviceInput;
+ #[cfg(feature = "host")]
+ pub use host::HostInput;
++#[cfg(feature = "host")]
++pub use pad::pad_to_btn;
+ pub use mask::Pad;
+--- a/crates\slot\src\input\pad.rs
++++ b/crates\slot\src\input\pad.rs
+@@ -1,22 +1,59 @@
+ use gilrs::Button;
+ use slot_input::Btn;
+ 
++/// The handheld (and the whole Slot UI) uses the Nintendo face layout:
++/// A on the right, B at the bottom, X on top, Y on the left. A PC pad in
++/// XInput mode is labelled the other way round (A bottom, B right, X left,
++/// Y top), so by default the buttons are swapped to feel Nintendo-correct.
++///
++/// `SLOT_PAD_XBOX=1` keeps the pad's own Xbox labels instead.
++fn xbox_face() -> bool {
++    std::env::var_os("SLOT_PAD_XBOX").is_some_and(|v| v != "0")
++}
++
++/// Some pads put their extra C/Z buttons the other way round, and a few
++/// players simply prefer it flipped. `SLOT_PAD_ZC_SWAP=1` swaps menu/power.
++fn zc_swap() -> bool {
++    std::env::var_os("SLOT_PAD_ZC_SWAP").is_some_and(|v| v != "0")
++}
++
+ pub fn pad_to_btn(button: Button) -> Option<Btn> {
++    let xbox = xbox_face();
+     Some(match button {
+         Button::DPadUp => Btn::Up,
+         Button::DPadDown => Btn::Down,
+         Button::DPadLeft => Btn::Left,
+         Button::DPadRight => Btn::Right,
++        // South = the bottom face button, East = the right one. Nintendo
++        // wants the bottom one to be B and the right one to be A.
++        Button::South if xbox => Btn::A,
++        Button::South => Btn::B,
++        Button::East if xbox => Btn::B,
+         Button::East => Btn::A,
+-        Button::South => Btn::B,
+-        Button::North => Btn::X,
+-        Button::West => Btn::Y,
++        // North = top, West = left. Nintendo: X on top, Y on the left.
++        Button::North if xbox => Btn::X,
++        Button::North => Btn::Y,
++        Button::West if xbox => Btn::Y,
++        Button::West => Btn::X,
+         Button::LeftTrigger => Btn::L1,
+         Button::RightTrigger => Btn::R1,
+         Button::LeftTrigger2 => Btn::L2,
+         Button::RightTrigger2 => Btn::R2,
+         Button::Start => Btn::Start,
+         Button::Select => Btn::Select,
++        // Extra face buttons on 6-button pads (gilrs C and Z), Nintendo
++        // order: C is the handheld's MENU key, Z its POWER key.
++        Button::C if zc_swap() => Btn::Power,
++        Button::C => Btn::Menu,
++        Button::Z if zc_swap() => Btn::Menu,
++        Button::Z => Btn::Power,
++        // Flydigi Vader 3 reports its extra C and Z buttons as stick clicks
++        // (L3/R3) over XInput, because XInput has no bits for them:
++        // L3 carries Z, R3 carries C.
++        Button::LeftThumb if zc_swap() => Btn::Menu,
++        Button::LeftThumb => Btn::Power,
++        Button::RightThumb if zc_swap() => Btn::Power,
++        Button::RightThumb => Btn::Menu,
+         Button::Mode => Btn::Menu,
+         _ => return None,
+     })
+--- a/crates\slot\src\lib.rs
++++ b/crates\slot\src\lib.rs
+@@ -1,3 +1,4 @@
++﻿pub mod about_page;
+ pub mod app;
+ pub mod audio;
+ pub mod bezel;
+@@ -7,6 +8,8 @@
+ pub mod cable;
+ pub mod card_log;
+ pub mod cart_faces;
++pub mod cheat_panel;
++pub mod cheats;
+ pub mod core;
+ pub mod core_picker;
+ #[cfg(unix)]
+@@ -30,6 +33,12 @@
+ pub mod link_screen;
+ pub mod link_start;
+ pub mod link_state;
++pub mod net;
++pub mod online;
++pub mod wifi_page;
++pub mod online_page;
++pub mod overlay;
++pub mod pinyin;
+ pub mod panel_turn;
+ pub mod persist;
+ pub mod prefetch;
+@@ -37,6 +46,8 @@
+ pub mod rewind;
+ pub mod root;
+ pub mod session;
++pub mod shortcuts;
++pub mod letter_page;
+ pub mod state_writer;
+ pub mod thumb;
+ pub mod video_mode;
+--- a/crates\slot\src\main.rs
++++ b/crates\slot\src\main.rs
+@@ -1,17 +1,180 @@
+-#[cfg(not(feature = "host"))]
++﻿#[cfg(not(feature = "host"))]
+ mod device_app;
+ #[cfg(feature = "host")]
+ mod host_app;
++#[cfg(feature = "host")]
++mod padtest;
+ 
+ fn main() {
+-    let mut args = std::env::args().skip(1);
+-    if args.next().as_deref() == Some("--init-root") {
+-        let Some(dir) = args.next() else {
+-            eprintln!("slot: --init-root needs a directory");
+-            std::process::exit(2);
+-        };
+-        slot::root::ensure(std::path::Path::new(&dir));
+-        return;
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    match args.first().map(String::as_str) {
++        Some("--init-root") => {
++            let Some(dir) = args.get(1) else {
++                eprintln!("slot: --init-root needs a directory");
++                std::process::exit(2);
++            };
++            slot::root::ensure(std::path::Path::new(dir));
++            return;
++        }
++        #[cfg(feature = "host")]
++        Some("--padtest") => padtest::run(),
++        Some("--wifi-status") => {
++            match slot::net::status() {
++                Ok(s) => println!(
++                    "state={} ssid={} ip={} mac={} connected={}",
++                    s.state, s.ssid, s.ip, s.mac, s.connected()
++                ),
++                Err(e) => {
++                    eprintln!("slot: wifi-status: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }
++        Some("--wifi-scan") => {
++            match slot::net::scan(std::time::Duration::from_secs(6)) {
++                Ok(list) => {
++                    for ssid in list {
++                        println!("{ssid}");
++                    }
++                }
++                Err(e) => {
++                    eprintln!("slot: wifi-scan: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }
++        Some("--wifi-join") => {
++            let Some(ssid) = args.get(1) else {
++                eprintln!("slot: --wifi-join needs an SSID and password");
++                std::process::exit(2);
++            };
++            let psk = args.get(2).cloned().unwrap_or_default();
++            let root = std::env::var_os("SLOT_ROOT")
++                .map(std::path::PathBuf::from)
++                .unwrap_or_else(|| std::path::PathBuf::from("."));
++            let creds = slot::net::Credentials {
++                ssid: ssid.clone(),
++                psk,
++            };
++            match slot::net::join(&root, &creds, std::time::Duration::from_secs(30)) {
++                Ok(s) => {
++                    println!("connected ssid={} ip={}", s.ssid, s.ip);
++                }
++                Err(e) => {
++                    eprintln!("slot: wifi-join: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }
++        Some("--rdb-info") => {
++            let Some(path) = args.get(1) else {
++                eprintln!("slot: --rdb-info needs a path");
++                std::process::exit(2);
++            };
++            let bytes = std::fs::read(path).unwrap_or_default();
++            let rdb = slot::online::Rdb::parse(&bytes);
++            println!("entries {}", rdb.len());
++            return;
++        }        Some("--online-label") => {
++            let Some(stem) = args.get(1) else {
++                eprintln!("slot: --online-label needs a ROM stem");
++                std::process::exit(2);
++            };
++            let root = std::env::var_os("SLOT_ROOT")
++                .map(std::path::PathBuf::from)
++                .unwrap_or_else(|| std::path::PathBuf::from("."));
++            let carts = slot_store::scan(&root).unwrap_or_default();
++            let Some(cart) = carts.into_iter().find(|c| c.stem == *stem) else {
++                eprintln!("slot: --online-label: no cart {stem}");
++                std::process::exit(1);
++            };
++            match slot::online::fetch_label(&root, &cart) {
++                Ok(path) => println!("saved {}", path.display()),
++                Err(e) => {
++                    eprintln!("slot: online-label: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }        Some("--online-cheats") => {
++            let Some(stem) = args.get(1) else {
++                eprintln!("slot: --online-cheats needs a ROM stem");
++                std::process::exit(2);
++            };
++            let root = std::env::var_os("SLOT_ROOT")
++                .map(std::path::PathBuf::from)
++                .unwrap_or_else(|| std::path::PathBuf::from("."));
++            let carts = slot_store::scan(&root).unwrap_or_default();
++            let Some(cart) = carts.into_iter().find(|c| c.stem == *stem) else {
++                eprintln!("slot: --online-cheats: no cart {stem}");
++                std::process::exit(1);
++            };
++            match slot::online::fetch_for_cart(&root, &cart, slot_store::Core::Mgba) {
++                Ok(path) => println!("saved {}", path.display()),
++                Err(e) => {
++                    eprintln!("slot: online-cheats: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }
++        Some("--online-sync") => {
++            let root = args
++                .get(1)
++                .map(std::path::PathBuf::from)
++                .or_else(|| std::env::var_os("SLOT_ROOT").map(std::path::PathBuf::from))
++                .unwrap_or_else(|| std::path::PathBuf::from("."));
++            let carts = slot_store::scan(&root).unwrap_or_default();
++            println!("sync: {} carts in {}", carts.len(), root.display());
++            let (mut cht, mut art, mut cht_miss, mut art_miss) = (0, 0, 0, 0);
++            for cart in carts {
++                let cht_here = root
++                    .join("Cheats/GBA/mgba")
++                    .join(format!("{}.cht", cart.stem))
++                    .exists()
++                    || root
++                        .join("Cheats/GBA/gpsp")
++                        .join(format!("{}.cht", cart.stem))
++                        .exists();
++                if !cht_here {
++                    match slot::online::fetch_for_cart(&root, &cart, slot_store::Core::Mgba) {
++                        Ok(_) => cht += 1,
++                        Err(_) => cht_miss += 1,
++                    }
++                }
++                let art_here = root
++                    .join("Labels/GBA")
++                    .join(format!("{}.png", cart.stem))
++                    .exists();
++                if !art_here {
++                    match slot::online::fetch_label(&root, &cart) {
++                        Ok(_) => art += 1,
++                        Err(_) => art_miss += 1,
++                    }
++                }
++                println!("done {} (cht {cht}/{cht_miss} art {art}/{art_miss})", cart.stem);
++            }
++            println!("sync summary: cheats {cht} miss {cht_miss}, labels {art} miss {art_miss}");
++            return;
++        }
++        Some("--net-get") => {
++            let (Some(url), Some(dest)) = (args.get(1), args.get(2)) else {
++                eprintln!("slot: --net-get needs a URL and a destination path");
++                std::process::exit(2);
++            };
++            match slot::net::download(url, std::path::Path::new(dest)) {
++                Ok(bytes) => println!("downloaded {bytes} bytes -> {dest}"),
++                Err(e) => {
++                    eprintln!("slot: net-get: {e}");
++                    std::process::exit(1);
++                }
++            }
++            return;
++        }
++        _ => {}
+     }
+     slot::crash::install();
+ 
+@@ -20,4 +183,4 @@
+ 
+     #[cfg(not(feature = "host"))]
+     device_app::run();
+-}
++}--- a/crates\slot\src\session.rs
++++ b/crates\slot\src\session.rs
+@@ -293,6 +293,9 @@
+         let ready = self.emu.as_ref().is_some_and(EmuHandle::has_published);
+         if ready && !self.app.game_ready() {
+             launch("first frame shown");
++            if std::env::var_os("SLOT_CHEATS_PREVIEW").is_some() {
++                self.app.preview_cheats();
++            }
+         }
+         self.app.set_game_ready(ready);
+         self.sync_speed();
+@@ -405,6 +408,7 @@
+                     || self.showing_polaroids()
+                     || self.dozing()
+                     || (self.held() && !self.app.link_active())
++                    || self.app.online_busy()
+                 {
+                     Speed::Paused
+                 } else if self.actually_fast_forwarding() {
+@@ -479,7 +483,7 @@
+         let player = self.app.link_player();
+         let palette = crate::core::palette_for(self.app.gb_palette(), platform, &rom, player);
+         self.app.set_palette_live(palette.is_some());
+-        let opened = open_core(
++        let mut opened = open_core(
+             &self.root,
+             core,
+             platform,
+@@ -490,6 +494,23 @@
+         );
+         self.app.set_named_core(opened.named);
+         launch("core opened");
++        if let Some(cart) = self.app.seated_cart() {
++            if cart.stem == stem {
++                if let Some(set) = crate::cheats::CheatSet::load(&self.root, cart, core) {
++                    let cheats: Vec<(u32, bool, String)> = set
++                        .cheats
++                        .iter()
++                        .enumerate()
++                        .filter(|(_, c)| c.enabled)
++                        .map(|(i, c)| (i as u32, true, c.code.clone()))
++                        .collect();
++                    if !cheats.is_empty() {
++                        launch(&format!("cheats: {} enabled", cheats.len()));
++                        opened.core.queue_cheats(cheats);
++                    }
++                }
++            }
++        }
+         let sav = persist::read_sav(&self.root, platform, stem);
+         launch("save read");
+         let ring = self.sink.ring();
