@@ -1,117 +1,90 @@
-# Slot 简体中文增强版（for Anbernic H700 系列）
+# Slot 简体中文强化版（for Anbernic H700 系列）
 
-基于 [BrandonKowalski/slot](https://github.com/BrandonKowalski/slot) **v1.7.0** 的简体中文汉化与增强分支，遵循上游 **GPL-3.0-or-later** 许可。
+基于 [BrandonKowalski/slot](https://github.com/BrandonKowalski/slot) **v1.9.0**（中文界面以「仲冬临沧的十一月」的 1.9.0 汉化 R1 为基底）扩充而来，遵循上游 **GPL-3.0-or-later** 许可。
 
-上游 Slot 是面向 Anbernic H700 掌机的 Game Boy / GBC / GBA 前端；本分支把界面汉化，并在不改变存档/ROM 格式的前提下增加了一批功能。
+Slot 是面向 Anbernic H700 掌机的 Game Boy / GBC / GBA 前端，本仓库只做汉化与功能增强，不改变存档/ROM 格式。
 
-> 本项目与 Anbernic、Nintendo 无隶属关系。ROM、BIOS、商业字体均不随本项目分发。
+> 本项目与 Anbernic、Nintendo 无关；ROM、BIOS 等商业内容请自备合法副本。
 
 **作者：Lbug9527** · https://github.com/Lbug9527
 
 ---
 
+## 下载
+
+- 最新固件：[Releases · v1.9.0-zh-1](https://github.com/Lbug9527/slot-zh/releases/tag/v1.9.0-zh-1)
+- 压缩包：`slot-v1.9.0-zh-2-h700.zip`（仲冬 10.24 资源 + 本仓库重编的 `System/slot`）
+- 系统底座：[BaseOS v1.5.2](https://github.com/pvaibhav/BaseOS/releases) 的 `baseos-rg34xx-1.5.2.bosupd`（放到卡根目录，开机会自动升级）
+
 ## 功能
 
-### 汉化
+### 界面
+- 全中文菜单、设置、查找、关于页；内置像素 CJK 字体
+- 字体可选：`System/Fonts/*.ttf|*.otf`，通用页 → 字体
+- 日期时间本地化（`10月27日 20:30`）
+- 主页 HUD：时间/电量放大、Wi‑Fi 图标（底边与时间对齐）
 
-- 菜单、提示、弹窗、时间（`10月21日 21:57`、`刚刚 / N 分钟前`）全中文
-- 金手指面板、Wi-Fi 设置、快捷键一览、关于页均为中文
+### 卡带
+- 卡带背景：选中卡带用其封面模糊铺底，220ms 交叉淡入
+- 收藏（Y）与收藏星标记
+- 货架切换：L1 / R1（GBA → GBC → GB）
+- 全部游戏列表（Select）：左对齐、收藏星、1 秒后弹出卡带预览（240×141 原比例）、长名滚动 + 两侧渐隐、长按左右连翻
 
-### 新增功能
+### 查找
+- X 打开拼音首字母面板，A–Z 字母表布局
+- 支持**多字母前缀与子序列**：`KDYG`、`KYG` 都能到「口袋妖怪」；不匹配时不跳转
+- 金手指 / 相册等翻页界面支持长按连续翻页
 
-| 功能 | 说明 |
-|---|---|
-| 卡带背景 | 选中卡带时用其标签图模糊铺底，切换时淡入淡出；无标签的卡带回落到卡带正面 |
-| 金手指 | 游戏内菜单打开，支持本地 `.cht`（`Cheats/GBA/{mgba,gpsp}/*.cht`），左右翻页，改动写回文件 |
-| 在线金手指 | 按 ROM CRC 匹配 libretro-database 并下载 `.cht`；失败时显示原因 |
-| 在线贴纸 | 按 ROM CRC 匹配 libretro-thumbnails 下载封面 |
-| 网络设置 | 扫描 Wi-Fi、屏上键盘（大小写/符号/显示密码）、保存多个 SSID 密码、开机自动连接 |
-| 字体选择 | 读取 `System/Fonts/*.ttf|*.otf`，可在「通用 → 字体」切换，重启生效 |
-| 拼音首字母查找 | 按 ROM 名拼音首字母跳转（X 键打开字母表） |
-| 快捷键一览 | 主菜单里一页看全所有按键 |
-| 休眠自动关机 | 3 / 10 / 30 分钟 / 永不；关机前保存一张游戏截图到 `Screenshots/` |
-| 低电量提醒 | 阈值 5%–30% 可调，游戏中右上角电池图标闪烁 |
-| HUD | 时间/电量字号放大，时间左侧增加 Wi-Fi 信号图标 |
-| 手柄 | 桌面开发窗口支持 gilrs 手柄；掌机走上游输入栈 |
+### 金手指
+- 本地：`Cheats/<平台>/<核心>/*.cht`，面板内 A 切换**即时生效**（无需重进游戏），左右翻页
+- 在线：按 ROM CRC 匹配 libretro-database，多镜像（jsDelivr / gh-proxy），失败有诊断页
 
-### 与上游一致的部分
+### 在线 / 网络
+- Wi‑Fi：扫描列表、软键盘（符号 / 大小写 / 显示密码）、自动连接、记住多个 SSID 密码
+- 在线贴纸：Select 下载当前卡带封面
+- 失败原因会写到 `Logs/slot.log` 与 `Logs/net-diag.txt`
 
-- ROM 需解压，仅支持 GBA / GB / GBC
-- 卡带目录 `Games/GBA`、`Games/GB`、`Games/GBC`
-- 存档 `Saves/`、即时存档 `States/`、标签 `Labels/`
-- 前端启动逻辑、双核（mGBA / gpSP）、联机、倒带、着色器等均沿用上游
+### 其他
+- 休眠自动关机（3 / 10 / 30 分钟 / 永不）
+- 低电量提醒（阈值 5%–30% 可调）
+- 关机存图：关机前把当前画面存到 `Screenshots/`
+- 手柄：支持 gilrs，可映射 Z/C 到菜单/电源
 
----
+## 截图
 
-## 支持机型
-
-与上游 v1.7.0 相同：
-
-| 机型 | 支持 | 说明 |
-|---|---|---|
-| Anbernic RG SP | ✅ | 上游首发机型 |
-| Anbernic RG34XX | ✅ | 本分支主要实测机型 |
-| Anbernic RG34XXSP | ✅ | 暂不支持摇杆（上游限制） |
-| Anbernic RG35XXSP | ✅ | 4:3 屏，游戏画面按上游逻辑加边框 |
-| Anbernic 35XX Plus | ✅ | |
-| Anbernic RG28XX | ✅ | 竖装屏，由上游自动旋转画面 |
-
-所有 H700 机型共用同一颗 SoC 与 ABI，**发布包是同一个 aarch64 二进制**；屏幕方向、宽高比、按键差异由上游的设备探测处理。
-
-机型对应的 BaseOS 卡镜像请到 [pvaibhav/BaseOS releases](https://github.com/pvaibhav/BaseOS/releases) 下载（文件名形如 `baseos-rg34xx-1.4.0.img.zip`、`baseos-rg35xxsp-…`、`baseos-rg28xx-…`）。
-
----
+![卡带背景](docs/images/cart-backdrop.png)
+![设置](docs/images/settings.png)
+![金手指](docs/images/cheats.png)
+![全部游戏](docs/images/all-games.png)
+![拼音查找](docs/images/find-by-pinyin.png)
+![Wi‑Fi](docs/images/wifi.png)
+![关于](docs/images/about.png)
 
 ## 安装
 
-1. 用 BaseOS 对应机型的镜像刷到 TF1（见 [docs/DEVICES.md](docs/DEVICES.md)）。
-2. 首次开机让 BaseOS 扩容（会格式化数据分区）。
-3. 关机拔卡，把本发布包里的 `System/`、`Cheats/`、`Labels/`（如有）复制到卡根目录。
-4. 可选：把中文字体放进 `System/Fonts/`（见 [docs/FONTS.md](docs/FONTS.md)）。
-5. 插卡开机。
+1. 解压 `slot-v1.9.0-zh-2-h700.zip`，把 `slot-v1.9.0-zh-2/` 里的内容**合并**到 SD 卡根目录（包含 `System/`）
+2. 若使用 BaseOS v1.5.2：把 `baseos-rg34xx-1.5.2.bosupd` 放卡根目录，开机等待升级完成（约 30 秒，可能自动重启）
+3. 首次启动 Slot 会自动创建目录索引；游戏放 `Games/GBA`、`Games/GB`、`Games/GBC`，封面放 `Labels/`
+4. 字体可选：`System/Fonts` 放 ttf/otf
 
-目录结构：
+## 支持的机型
 
-```
-TF1:/
-├─ System/
-│  ├─ slot                 # 本前端（aarch64）
-│  ├─ launch_frontend.sh
-│  ├─ coresave.sh
-│  ├─ led.sh / slotlink.sh
-│  ├─ mgba_libretro.so / gpsp_libretro.so
-│  ├─ bootlogo.bmp
-│  ├─ bezels/
-│  └─ Fonts/               # 可选，自备字体
-├─ Games/{GBA,GB,GBC}/
-├─ Saves/  States/  Labels/  Cheats/  Config/  Logs/
-```
-
----
+本仓库的二进制是 H700 通用 aarch64 包，上游 Slot 1.9.0 已适配：RG34XX、RG34XXSP、RG35XXSP、RG28XX 等；系统底座请按机型下载对应的 BaseOS 镜像。
 
 ## 已知限制
 
-- **在线金手指/贴纸依赖 libretro 数据库**：只认 No-Intro 名称 + ROM CRC。实测 534 个中文/改版 ROM 中约 74 个能匹配；匹配不到时会提示「本作在线暂无金手指」，这是数据源覆盖问题，不是网络故障。
-- **在线贴纸**对中文改名的 ROM 基本无法匹配，建议用离线封面（`Labels/GBA/<与 ROM 同名>.png`）。
-- **在线功能需要 Wi-Fi**（H700 内置 RTL8821CS，BaseOS 负责加载驱动，前端负责连接与 DHCP）。
-- **字体**：发布包不自带商业字体；默认使用内置像素字体，中文可读但字形较硬，建议放一份开源中文字体。
-- **RG28XX 旋转、RG35XXSP 边框、RG34XX 专属亮度/菜单组合键** 等设备差异由上游处理，本分支未改动。
+- 在线金手指依赖 libretro-database 的 CRC 覆盖，中文改版 ROM 多数查不到
+- 在线贴纸按 No-Intro 英文名匹配，中文重命名的 ROM 建议用离线封面
+- 内置字体为 Noto Sans CJK SC 子集（OFL-1.1）
+- 1.9 的字体行按 A 会进入独立字体页，行内不显示当前字体名
 
----
+## 免责声明
 
-## 构建
-
-见 [docs/BUILD.md](docs/BUILD.md)。改动清单见 [patches/](patches/) 与仓库提交记录。
-
-## 许可
-
-- 本分支：**GPL-3.0-or-later**，与上游一致，见 [LICENSE](LICENSE)。
-- 上游 Slot © BrandonKowalski 及其贡献者。
-- 内置像素字体、图标、美术资源版权归原作者；若来源不明将替换为 OFL 字体后再发布。
+仅供个人学习与设备备份使用，按现状提供，不附带任何担保；刷机与使用风险由使用者自行承担。
 
 ## 致谢
 
-- [BrandonKowalski/slot](https://github.com/BrandonKowalski/slot)
-- [pvaibhav/BaseOS](https://github.com/pvaibhav/BaseOS)
-- [libretro-database](https://github.com/libretro/libretro-database) / [libretro-thumbnails](https://github.com/libretro-thumbnails)
-- 1.6.0 汉化版作者（B 站 @仲冬临沧的十一月）提供的排版与词表参考
+- 上游：[BrandonKowalski/slot](https://github.com/BrandonKowalski/slot)（GPL-3.0）
+- 1.9.0 汉化基底：[仲冬临沧的十一月](https://space.bilibili.com/75961128)
+- 系统底座：[pvaibhav/BaseOS](https://github.com/pvaibhav/BaseOS)
+- 金手指数据：[libretro-database](https://github.com/libretro/libretro-database)
